@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Caption publisher (test)</title>
+  <link rel="icon" href="/favicon.ico" sizes="any" />
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  <script src="https://cdn.ably.com/lib/ably.min-2.js"></script>
+  <script src="./glue.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 36rem; margin: 1rem auto; padding: 0 0.75rem; }
+    label { display: block; margin-top: 0.75rem; font-size: 0.85rem; color: #444; }
+    input, textarea, button { width: 100%; font: inherit; margin-top: 0.25rem; box-sizing: border-box; }
+    textarea { min-height: 5rem; }
+    #state { font-size: 0.85rem; color: #666; margin-top: 0.5rem; }
+    .row { display: flex; gap: 0.5rem; margin-top: 0.75rem; }
+    .row button { flex: 1; }
+  </style>
+</head>
+<body>
+  <h1>Caption publisher (dev)</h1>
+  <p>
+    Use this page to test Ably without whisper. For production, load <code>glue.js</code> next to your whisper app
+    and call <code>connectJitsiCaptionsPublisher</code> / <code>publishCaption</code> as in the README.
+  </p>
+  <label>Channel (e.g. captions:abc…)</label>
+  <input id="channel" type="text" autocomplete="off" />
+  <label>Publisher token</label>
+  <textarea id="token" rows="3" autocomplete="off"></textarea>
+  <button type="button" id="connect">Connect</button>
+  <p id="state">disconnected</p>
+  <label>Simulated line (partial updates coalesce)</label>
+  <textarea id="draft" placeholder="Type caption text…"></textarea>
+  <div class="row">
+    <button type="button" id="send-partial">Send partial</button>
+    <button type="button" id="send-final">Send final</button>
+  </div>
+  <script>
+    let pub = null;
+    const state = document.getElementById("state");
+    function setState(s) {
+      state.textContent = s;
+    }
+    document.getElementById("connect").onclick = async () => {
+      const channel = document.getElementById("channel").value.trim();
+      const token = document.getElementById("token").value.trim();
+      if (!channel || !token) {
+        alert("channel + token required");
+        return;
+      }
+      if (pub) pub.close();
+      pub = new JitsiCaptionsAblyPublisher({ debounceMs: 400, minIntervalMs: 450 });
+      try {
+        await pub.connect({ channel, token });
+        setState(
+          "connected · session " +
+            pub.connectionState +
+            " · channel " +
+            pub.channelState
+        );
+        const rt = pub.realtime;
+        if (rt) {
+          rt.connection.on("disconnected", () => setState("disconnected"));
+          rt.connection.on("failed", () => setState("connection failed"));
+        }
+      } catch (e) {
+        setState("error: " + (e.message || e));
+      }
+    };
+    document.getElementById("send-partial").onclick = () => {
+      if (!pub) return alert("connect first");
+      const t = document.getElementById("draft").value.trim();
+      if (!t) return alert("Type some caption text first");
+      pub.publishCaption({ text: t, kind: "partial" });
+    };
+    document.getElementById("send-final").onclick = () => {
+      if (!pub) return alert("connect first");
+      const t = document.getElementById("draft").value.trim();
+      if (!t) return alert("Type some caption text first");
+      pub.publishCaption({ text: t, kind: "final" });
+    };
+  </script>
+</body>
+</html>
