@@ -2,7 +2,7 @@
  * Ably publisher helper for browser-side caption apps (e.g. whisper.cpp in WebAssembly).
  *
  * Usage after `connect()`:
- *   const pub = new JitsiCaptionsAblyPublisher();
+ *   const pub = new CaptionsAblyPublisher();
  *   await pub.connect({ channel: 'captions:…', token: '<publisher token>' });
  *   pub.publishCaption({ text: 'hello', kind: 'partial' });
  *
@@ -19,7 +19,7 @@ function normalizeCaptionChannel(raw) {
   const m = /^captions:([a-fA-F0-9-]+)$/.exec(s);
   if (!m) {
     throw new Error(
-      "Channel must be exactly captions:<session_hex> from `jitsi-captions session new` (hex only after the colon). " +
+      "Channel must be exactly captions:<session_hex> from `captions session new` (hex only after the colon). " +
         "Example: captions:591d0445c9494c0dbf4891b54278ca92 — no spaces, prefixes, or query junk."
     );
   }
@@ -31,13 +31,13 @@ function normalizeCaptionChannel(raw) {
   }
   if (slug === "cap") {
     throw new Error(
-      'Channel "captions:cap" is not a session id — paste the full channel from `jitsi-captions session new` (captions: plus 32 hex digits).'
+      'Channel "captions:cap" is not a session id — paste the full channel from `captions session new` (captions: plus 32 hex digits).'
     );
   }
   return `captions:${slug}`;
 }
 
-class JitsiCaptionsAblyPublisher {
+class CaptionsAblyPublisher {
   static CAPTION_EVENT = "caption";
 
   /**
@@ -149,9 +149,9 @@ class JitsiCaptionsAblyPublisher {
       }
       this._lastFlush = Date.now();
       try {
-        await this._channel.publish(JitsiCaptionsAblyPublisher.CAPTION_EVENT, body);
+        await this._channel.publish(CaptionsAblyPublisher.CAPTION_EVENT, body);
       } catch (err) {
-        console.error("[jitsi-captions] Ably publish failed:", err);
+        console.error("[captions-relay] Ably publish failed:", err);
       }
     };
 
@@ -195,27 +195,27 @@ class JitsiCaptionsAblyPublisher {
   }
 }
 
-globalThis.JitsiCaptionsAblyPublisher = JitsiCaptionsAblyPublisher;
+globalThis.CaptionsAblyPublisher = CaptionsAblyPublisher;
 globalThis.normalizeCaptionChannel = normalizeCaptionChannel;
 
 /** @deprecated Use the class — kept for quick paste integration */
 function publishCaption(payload) {
-  if (!globalThis.__jitsiCaptionsPublisher) {
-    throw new Error("Call connectJitsiCaptionsPublisher first");
+  if (!globalThis.__captionsPublisher) {
+    throw new Error("Call connectCaptionsPublisher first");
   }
-  globalThis.__jitsiCaptionsPublisher.publishCaption(payload);
+  globalThis.__captionsPublisher.publishCaption(payload);
 }
 
 /**
  * One-liner setup for whisper hooks: stores singleton used by publishCaption().
  * @param {{ channel: string, token: string }} params
  */
-async function connectJitsiCaptionsPublisher(params) {
-  const p = new JitsiCaptionsAblyPublisher();
+async function connectCaptionsPublisher(params) {
+  const p = new CaptionsAblyPublisher();
   await p.connect(params);
-  globalThis.__jitsiCaptionsPublisher = p;
+  globalThis.__captionsPublisher = p;
   return p;
 }
 
-globalThis.connectJitsiCaptionsPublisher = connectJitsiCaptionsPublisher;
+globalThis.connectCaptionsPublisher = connectCaptionsPublisher;
 globalThis.publishCaption = publishCaption;

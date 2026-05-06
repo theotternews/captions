@@ -5,7 +5,7 @@ from __future__ import annotations
 from ably.sync.rest.rest import AblyRestSync
 from ably.types.tokendetails import TokenDetails
 
-from jitsi_captions.config import channel_for_session, get_ably_api_key
+from captions_relay.config import channel_for_session, get_ably_api_key
 
 
 def _client() -> AblyRestSync:

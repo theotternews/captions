@@ -1,6 +1,6 @@
-# jitsi-captions
+# captions-relay
 
-Python CLI plus static web pages that relay **live caption text** to a small audience over **[Ably](https://ably.com)** pub/sub — a parallel “companion captions” lane while video runs in **Jitsi Meet** (or any call). Whisper / STT stays on your machine; subscribers only receive **short JSON caption events**.
+Python CLI plus static web pages that relay **live caption text** to a small audience over **[Ably](https://ably.com)** pub/sub—a parallel “companion captions” lane alongside **any video meeting**. Whisper / STT stays on your machine; subscribers only receive **short JSON caption events**.
 
 ## Prerequisites
 
@@ -10,9 +10,9 @@ Python CLI plus static web pages that relay **live caption text** to a small aud
 ## Install (dev)
 
 ```bash
-cd /path/to/jitsi-captions
+cd /path/to/captions-relay
 uv sync
-export JITSI_CAPTIONS_ABLY_API_KEY='your_app_id.key_id:secret'
+export CAPTIONS_ABLY_API_KEY='your_app_id.key_id:secret'
 ```
 
 Keep the root key **only** on the facilitator’s machine (or a future token broker). Browsers get **short-lived tokens** from the CLI.
@@ -20,13 +20,13 @@ Keep the root key **only** on the facilitator’s machine (or a future token bro
 ## Create a session
 
 ```bash
-uv run jitsi-captions session new
+uv run captions session new
 ```
 
 Or JSON for scripting:
 
 ```bash
-uv run jitsi-captions session new --json
+uv run captions session new --json
 ```
 
 This prints:
@@ -34,13 +34,13 @@ This prints:
 - `session_id` and `channel` (`captions:<hex>`)
 - **`publisher_token`** — **secret**; used in the tab that runs captioning / whisper
 - **`subscriber_token`** — share with Deaf / processing-access participants
-- Default TTL **4 hours** (override with `--ttl` or env `JITSI_CAPTIONS_TOKEN_TTL`)
+- Default TTL **4 hours** (override with `--ttl` or env `CAPTIONS_TOKEN_TTL`)
 
 Refresh tokens only:
 
 ```bash
-uv run jitsi-captions tokens publisher <session_id>
-uv run jitsi-captions tokens subscriber <session_id>
+uv run captions tokens publisher <session_id>
+uv run captions tokens subscriber <session_id>
 ```
 
 ## Serve the static web UI
@@ -74,7 +74,7 @@ For phones on the same LAN, use your machine’s LAN IP instead of `localhost`.
 2. Once per session (after you have `channel` + `publisher_token` from the CLI):
 
 ```javascript
-await connectJitsiCaptionsPublisher({
+await connectCaptionsPublisher({
   channel: "captions:…………",
   token: "<publisher_token>",
 });
@@ -92,17 +92,30 @@ publishCaption({
 Or use the class directly for more control:
 
 ```javascript
-const pub = new JitsiCaptionsAblyPublisher({ debounceMs: 450, minIntervalMs: 450 });
+const pub = new CaptionsAblyPublisher({ debounceMs: 450, minIntervalMs: 450 });
 await pub.connect({ channel, token });
 pub.publishCaption({ text: "…", kind: "partial" });
 ```
 
 Coalescing keeps partial traffic roughly under **~2 messages/second**; finals flush immediately.
 
+## Publish from whisper.cpp (PulseAudio, CLI)
+
+Linux only: capture from PulseAudio, run **`whisper-stream-pcm`**, and publish transcript lines to Ably.
+
+```bash
+export CAPTIONS_PUBLISHER_TOKEN='<publisher_token from session new>'
+export WHISPER_CPP_HOME=/path/to/whisper.cpp   # defaults: build/bin/whisper-stream-pcm, models/ggml-base.bin
+
+uv run captions whisper pulse --session-id YOUR_SESSION_HEX -v
+```
+
+Use **`--dry-run`** to print the resolved `ffmpeg | whisper-stream-pcm` shell command without Ably or audio. Paths can be overridden with `--whisper-binary`, `-m` / `--model`, or env **`CAPTIONS_WHISPER_STREAM_PCM`** / **`CAPTIONS_WHISPER_MODEL`**.
+
 ## Two-phone rehearsal checklist
 
-1. Export `JITSI_CAPTIONS_ABLY_API_KEY` on the facilitator laptop.
-2. Run `uv run jitsi-captions session new` — copy **`subscriber_token`** and note **`channel`**.
+1. Export `CAPTIONS_ABLY_API_KEY` on the facilitator laptop.
+2. Run `uv run captions session new` — copy **`subscriber_token`** and note **`channel`**.
 3. Start `python -m http.server 8765` from `web/`.
 4. On phone A (subscriber): open subscriber URL **with `?channel=`** matching the CLI output exactly; paste **subscriber** token; status should reach **Listening · channel attached** before testing.
 5. On laptop: open publisher test page → connect with **publisher** token → send partial/final; confirm phone A updates.
@@ -118,8 +131,8 @@ Coalescing keeps partial traffic roughly under **~2 messages/second**; finals fl
 
 4. **Empty publisher draft** — The dev publisher requires **non-empty** text before **Send partial** / **Send final**.
 
-5. **DevTools console** — Publisher logs **`Ably publish failed`** on rejections; subscriber logs **`[jitsi-captions subscriber]`** for subscribe/attach errors.
+5. **DevTools console** — Publisher logs **`Ably publish failed`** on rejections; subscriber logs **`[captions-relay subscriber]`** for subscribe/attach errors.
 
-6. **`Channel denied access…` / Ably code 40160** — Tokens are capped to your session channel only. Typical causes: the **subscriber** token was pasted into the publisher (no **publish** on that channel); or **`JITSI_CAPTIONS_ABLY_API_KEY`** is a **restricted** key — minted caps are intersected with the key’s dashboard scope, which can forbid publish entirely. Prefer a default full-access/root key until you carve a dedicated token-minting key with **publish + subscribe** on **`captions:*`** (or the exact channel prefix you use).
+6. **`Channel denied access…` / Ably code 40160** — Tokens are capped to your session channel only. Typical causes: the **subscriber** token was pasted into the publisher (no **publish** on that channel); or **`CAPTIONS_ABLY_API_KEY`** is a **restricted** key — minted caps are intersected with the key’s dashboard scope, which can forbid publish entirely. Prefer a default full-access/root key until you carve a dedicated token-minting key with **publish + subscribe** on **`captions:*`** (or the exact channel prefix you use).
 
 7. **`channelId = cap` in an error message** — That usually means the Realtime library is attaching to **`captions:cap`**, almost always because the publisher **channel field was shortened or pasted wrong** (`cap` parses as hexadecimal). Paste the whole **`captions:` + session hex** from `session new` (32 lowercase hex characters after you strip hyphens).

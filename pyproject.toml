@@ -1,7 +1,7 @@
 [project]
-name = "jitsi-captions"
+name = "captions-relay"
 version = "0.1.0"
-description = "Jitsi captions CLI"
+description = "Live meeting captions relay over Ably"
 requires-python = ">=3.13"
 dependencies = [
     "ably>=3.1.2",
@@ -9,7 +9,7 @@ dependencies = [
 ]
 
 [project.scripts]
-jitsi-captions = "jitsi_captions.cli:main"
+captions = "captions_relay.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.9.21,<0.10.0"]

@@ -118,11 +118,11 @@
       <div id="current" aria-live="assertive" class="partial"></div>
     </div>
   </main>
-  <footer>jitsi-captions · Ably subscriber</footer>
+  <footer>captions-relay · Ably subscriber</footer>
   <script>
     const CAPTION_EVENT = "caption";
-    const STORAGE_TOKEN = "jitsi_captions_subscriber_token";
-    const STORAGE_CHANNEL = "jitsi_captions_channel";
+    const STORAGE_TOKEN = "captions_subscriber_token";
+    const STORAGE_CHANNEL = "captions_channel";
 
     const params = new URLSearchParams(location.search);
     const channelFromQuery = params.get("channel") || "";
@@ -248,7 +248,7 @@
             .catch((err) => {
               const msg = err && err.message ? err.message : String(err);
               setStatus("Subscribe / attach failed: " + msg, "error");
-              console.error("[jitsi-captions subscriber]", err);
+              console.error("[captions-relay subscriber]", err);
             });
         }
 
