@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="description" content="Open the jitsi-captions subscriber to receive live captions over Ably." />
+  <title>jitsi-captions · Subscriber</title>
+  <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+  <style>
+    :root {
+      --bg: #0b0b0c;
+      --fg: #f4f4f5;
+      --muted: #a1a1aa;
+      --accent: #22c55e;
+      --accent-fg: #052e14;
+      --border: #27272a;
+      --input-bg: #18181b;
+      --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100dvh;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: var(--font);
+      line-height: 1.45;
+      padding: 1.25rem clamp(1rem, 4vw, 2rem) 2rem;
+    }
+    main {
+      max-width: 36rem;
+      margin: 0 auto;
+    }
+    h1 {
+      font-size: clamp(1.35rem, 4vw, 1.75rem);
+      font-weight: 650;
+      margin: 0 0 0.35rem;
+      letter-spacing: -0.02em;
+    }
+    .lede {
+      color: var(--muted);
+      font-size: 0.95rem;
+      margin: 0 0 1.5rem;
+    }
+    section {
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1rem 1.1rem;
+      margin-bottom: 1rem;
+      background: #111113;
+    }
+    section h2 {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      margin: 0 0 0.75rem;
+      font-weight: 600;
+    }
+    label {
+      display: block;
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin-bottom: 0.35rem;
+    }
+    input[type="text"] {
+      width: 100%;
+      font: inherit;
+      border-radius: 8px;
+      border: 1px solid #3f3f46;
+      background: var(--input-bg);
+      color: var(--fg);
+      padding: 0.65rem 0.75rem;
+      margin-bottom: 0.65rem;
+    }
+    input::placeholder {
+      color: #71717a;
+    }
+    button, .btn {
+      display: inline-block;
+      font: inherit;
+      font-weight: 600;
+      border: none;
+      border-radius: 8px;
+      padding: 0.65rem 1rem;
+      cursor: pointer;
+      text-decoration: none;
+      text-align: center;
+    }
+    button.primary, a.primary {
+      background: var(--accent);
+      color: var(--accent-fg);
+      width: 100%;
+    }
+    button.primary:hover, a.primary:hover {
+      filter: brightness(1.06);
+    }
+    .secondary-row {
+      margin-top: 0.65rem;
+    }
+    a.ghost {
+      background: #3f3f46;
+      color: #fafafa;
+      width: 100%;
+    }
+    code, samp {
+      font-family: ui-monospace, "Cascadia Code", "SF Mono", Menlo, monospace;
+      font-size: 0.88em;
+      word-break: break-all;
+    }
+    .hint {
+      font-size: 0.85rem;
+      color: var(--muted);
+      margin: 0.5rem 0 0;
+    }
+    footer {
+      margin-top: 1.75rem;
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+    footer a {
+      color: var(--accent);
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Live captions subscriber</h1>
+    <p class="lede">
+      Receive caption lines broadcast from your facilitator’s session over Ably. You need the subscriber token and the session channel (<code>captions:…</code>) from <code>jitsi-captions session new</code>.
+    </p>
+
+    <section aria-labelledby="open-heading">
+      <h2 id="open-heading">Open subscriber</h2>
+      <label for="channel">Channel (from facilitator)</label>
+      <input
+        id="channel"
+        type="text"
+        autocomplete="off"
+        autocapitalize="off"
+        spellcheck="false"
+        placeholder="captions:591d0445… or full subscriber URL query"
+      />
+      <button type="button" class="primary" id="open-btn">Open subscriber page</button>
+      <p class="hint" id="preview"></p>
+      <div class="secondary-row">
+        <a class="btn ghost" href="./subscriber/index.html">Open subscriber without channel</a>
+      </div>
+    </section>
+
+    <section aria-labelledby="manual-heading">
+      <h2 id="manual-heading">Manual link</h2>
+      <p class="hint" style="margin-top:0">
+        Bookmark or share this pattern (replace <code>YOUR_CHANNEL</code>):
+      </p>
+      <p style="margin:0.5rem 0 0;font-size:0.85rem;">
+        <samp id="pattern"></samp>
+      </p>
+    </section>
+
+    <footer>
+      Project: <a href="https://github.com/theotternews/captions">captions</a> · static Pages root is this repo’s <code>/docs</code> folder.
+    </footer>
+  </main>
+  <script>
+    (function () {
+      const baseSubscriber = new URL("./subscriber/index.html", location.href).href.split("?")[0];
+      const patternEl = document.getElementById("pattern");
+      patternEl.textContent =
+        baseSubscriber + "?channel=captions:YOUR_SESSION_HEX";
+
+      const channelInput = document.getElementById("channel");
+      const preview = document.getElementById("preview");
+
+      function stripChannelFromPaste(raw) {
+        const s = String(raw ?? "").trim();
+        try {
+          const u = new URL(s);
+          const q = u.searchParams.get("channel");
+          return q ? q.trim() : s;
+        } catch (_) {
+          return s;
+        }
+      }
+
+      function openSubscriber() {
+        const raw = stripChannelFromPaste(channelInput.value);
+        if (!raw) {
+          preview.textContent = "Enter a captions:… channel or paste a subscriber URL.";
+          channelInput.focus();
+          return;
+        }
+        const url = new URL("./subscriber/index.html", location.href);
+        url.searchParams.set("channel", raw);
+        preview.textContent = "";
+        location.href = url.href;
+      }
+
+      document.getElementById("open-btn").addEventListener("click", openSubscriber);
+      channelInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          openSubscriber();
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
