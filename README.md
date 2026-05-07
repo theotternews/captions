@@ -31,6 +31,13 @@ Or JSON for scripting:
 uv run captions session new --json
 ```
 
+**`--pulse`** — After printing the session, start **`whisper pulse`** with the new **channel** and **publisher token** (same requirements as `whisper pulse`: `WHISPER_CPP_HOME` / binary + model env vars). Not compatible with **`--json`**. Use **`-v`** to mirror whisper’s raw stdout bytes on **stderr**.
+
+```bash
+export WHISPER_CPP_HOME=/path/to/whisper.cpp
+uv run captions session new --pulse -v
+```
+
 This prints:
 
 - **`channel`** — Ably channel name (default new sessions use `captions:<random uuid hex>`)
@@ -129,6 +136,8 @@ Coalescing keeps partial traffic roughly under **~2 messages/second**; finals fl
 
 Linux only: capture from PulseAudio, run **`whisper-stream-pcm`**, and publish transcript lines to Ably.
 
+You can mint tokens and start pulse in one step: **`uv run captions session new --pulse`** (see *Create a session*). The flow below is the explicit two-command form.
+
 ```bash
 export CAPTIONS_PUBLISHER_TOKEN='<publisher_token from session new>'
 export WHISPER_CPP_HOME=/path/to/whisper.cpp   # defaults: build/bin/whisper-stream-pcm, models/ggml-base.bin
@@ -136,7 +145,7 @@ export WHISPER_CPP_HOME=/path/to/whisper.cpp   # defaults: build/bin/whisper-str
 uv run captions whisper pulse --channel '<channel from session new>' -v
 ```
 
-Use **`--dry-run`** to print the resolved `ffmpeg | whisper-stream-pcm` shell command without Ably or audio. Paths can be overridden with `--whisper-binary`, `-m` / `--model`, or env **`CAPTIONS_WHISPER_STREAM_PCM`** / **`CAPTIONS_WHISPER_MODEL`**.
+Use **`--dry-run`** to print the resolved `ffmpeg | whisper-stream-pcm` shell command without Ably or audio. Paths can be overridden with `--whisper-binary`, `-m` / `--model`, or env **`CAPTIONS_WHISPER_STREAM_PCM`** / **`CAPTIONS_WHISPER_MODEL`**. The pulse pipeline attaches whisper’s **stdout to a pseudo-TTY** (winsize matched to your **stderr** when it’s a terminal), so whisper uses the same **`\r` / ANSI rewrites** as when you run it interactively; a plain pipe would make it fall back to newline logging and look “duplicated”. **`--verbose`** (`-v`) copies that **raw PTY output** to **`stderr`** in **chunks** via `stderr.buffer` (no log prefixes). Captions on Ably still use UTF-8–decoded lines split on `\n` (plus any trailing bytes at EOF). Ably client log noise stays suppressed during `whisper pulse`.
 
 **Pulse publishes raw stdout lines** (TTY escapes preserved). Normalization happens in the subscriber page so on-screen edits match what a terminal would show.
 

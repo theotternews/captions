@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
 import shlex
 import uuid
@@ -84,8 +83,32 @@ def session() -> None:
     default=None,
     help="Ably channel name; default: random captions:<uuidhex>.",
 )
-def session_new(ttl: int | None, as_json: bool, channel: str | None) -> None:
+@click.option(
+    "--pulse",
+    "start_pulse",
+    is_flag=True,
+    help=(
+        "After creating the session, start whisper pulse (same env/options as "
+        "`whisper pulse` except channel and publisher token come from this command)."
+    ),
+)
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    help="With --pulse: echo raw whisper stdout to stderr (see whisper pulse -v).",
+)
+def session_new(
+    ttl: int | None,
+    as_json: bool,
+    channel: str | None,
+    start_pulse: bool,
+    verbose: bool,
+) -> None:
     """Generate a channel name and short-lived publisher/subscriber tokens."""
+    if start_pulse and as_json:
+        raise click.UsageError("Cannot combine --pulse with --json.")
+
     ttl_eff = ttl if ttl is not None else _default_ttl()
     channel = _channel_for_session_new(channel)
     try:
@@ -128,6 +151,18 @@ def session_new(ttl: int | None, as_json: bool, channel: str | None) -> None:
     click.echo("")
     click.echo("Subscriber URL:")
     click.echo(f"  {subscriber_index_url(channel)}")
+
+    if start_pulse:
+        click.echo("")
+        click.echo(click.style("Starting whisper pulse…", bold=True))
+        _run_whisper_pulse(
+            channel,
+            pub.token,
+            whisper_cpp_home=os.environ.get(ENV_WHISPER_CPP_HOME),
+            whisper_binary=os.environ.get(ENV_WHISPER_BINARY),
+            model_path=os.environ.get(ENV_WHISPER_MODEL),
+            verbose=verbose,
+        )
 
 
 @session.command("delete")
@@ -319,6 +354,88 @@ def _normalize_cli_channel(channel: str, *, param_hint: str) -> str:
         raise click.BadParameter(str(e), param_hint=param_hint) from e
 
 
+def _run_whisper_pulse(
+    channel: str,
+    publisher_token: str,
+    *,
+    ffmpeg_bin: str = "ffmpeg",
+    pulse_device: str = "whisper_sink.monitor",
+    sample_rate: int = 16000,
+    pcm_format: str = "s16",
+    step_ms: int = 1000,
+    length_ms: int = 10000,
+    keep_ms: int = 500,
+    whisper_cpp_home: str | None = None,
+    whisper_binary: str | None = None,
+    model_path: str | None = None,
+    extra_whisper_args: str = "",
+    line_kind: str = "final",
+    debounce_ms: int = 400,
+    min_interval_ms: int = 450,
+    dry_run: bool = False,
+    verbose: bool = False,
+) -> None:
+    """Shared implementation for ``whisper pulse`` and ``session new --pulse``."""
+    ch = _normalize_cli_channel(channel, param_hint="channel")
+
+    wb, mp = _resolve_whisper_paths_from_home(whisper_cpp_home, whisper_binary, model_path)
+
+    if not wb:
+        raise click.UsageError(
+            f"Set --whisper-cpp-home / {ENV_WHISPER_CPP_HOME}, "
+            f"or pass --whisper-binary, or set {ENV_WHISPER_BINARY}."
+        )
+
+    if not mp:
+        raise click.UsageError(
+            f"Set --whisper-cpp-home / {ENV_WHISPER_CPP_HOME}, "
+            f"or pass --model / -m, or set {ENV_WHISPER_MODEL}."
+        )
+
+    tok = (publisher_token or "").strip()
+    if not tok and not dry_run:
+        raise click.UsageError(f"Pass --publisher-token or set {ENV_PUBLISHER_TOKEN}.")
+
+    try:
+        extras = shlex.split(extra_whisper_args) if extra_whisper_args.strip() else []
+    except ValueError as e:
+        raise click.BadParameter(str(e), param_hint="extra-whisper-args") from e
+
+    shell_cmd = build_pulse_pipeline_command(
+        ffmpeg_bin=ffmpeg_bin,
+        pulse_device=pulse_device,
+        sample_rate=sample_rate,
+        whisper_bin=wb,
+        model_path=mp,
+        pcm_format=pcm_format,
+        step_ms=step_ms,
+        length_ms=length_ms,
+        keep_ms=keep_ms,
+        extra_whisper_args=extras,
+    )
+
+    if dry_run:
+        click.echo(shell_cmd)
+        return
+
+    async def _run() -> None:
+        await run_pulse_caption_pipeline(
+            channel=ch,
+            publisher_token=tok,
+            shell_command=shell_cmd,
+            line_kind=line_kind,
+            debounce_ms=debounce_ms,
+            min_interval_ms=min_interval_ms,
+            quiet_ably_logs=True,
+            verbose_echo_whisper=verbose,
+        )
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        click.echo("", err=True)
+
+
 @main.group()
 def whisper() -> None:
     """Stream local whisper transcript lines to Ably (publisher)."""
@@ -403,7 +520,12 @@ def whisper() -> None:
     is_flag=True,
     help="Print the ffmpeg | whisper shell command and exit (no Ably, no subprocess).",
 )
-@click.option("-v", "--verbose", is_flag=True, help="Enable INFO logging.")
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    help="Echo whisper's raw stdout bytes to stderr (no log formatting; Ably log level unchanged but defaults stay quiet).",
+)
 def whisper_pulse(
     channel: str,
     publisher_token: str | None,
@@ -425,63 +547,23 @@ def whisper_pulse(
     verbose: bool,
 ) -> None:
     """PulseAudio → ffmpeg (WAV) → whisper-stream-pcm; publish stdout lines to Ably."""
-    ch = _normalize_cli_channel(channel, param_hint="channel")
-
-    wb, mp = _resolve_whisper_paths_from_home(whisper_cpp_home, whisper_binary, model_path)
-
-    if not wb:
-        raise click.UsageError(
-            f"Set --whisper-cpp-home / {ENV_WHISPER_CPP_HOME}, "
-            f"or pass --whisper-binary, or set {ENV_WHISPER_BINARY}."
-        )
-
-    if not mp:
-        raise click.UsageError(
-            f"Set --whisper-cpp-home / {ENV_WHISPER_CPP_HOME}, "
-            f"or pass --model / -m, or set {ENV_WHISPER_MODEL}."
-        )
-
-    tok = (publisher_token or "").strip()
-    if not tok and not dry_run:
-        raise click.UsageError(f"Pass --publisher-token or set {ENV_PUBLISHER_TOKEN}.")
-
-    try:
-        extras = shlex.split(extra_whisper_args) if extra_whisper_args.strip() else []
-    except ValueError as e:
-        raise click.BadParameter(str(e), param_hint="extra-whisper-args") from e
-
-    shell_cmd = build_pulse_pipeline_command(
+    _run_whisper_pulse(
+        channel,
+        publisher_token or "",
         ffmpeg_bin=ffmpeg_bin,
         pulse_device=pulse_device,
         sample_rate=sample_rate,
-        whisper_bin=wb,
-        model_path=mp,
         pcm_format=pcm_format,
         step_ms=step_ms,
         length_ms=length_ms,
         keep_ms=keep_ms,
-        extra_whisper_args=extras,
+        whisper_cpp_home=whisper_cpp_home,
+        whisper_binary=whisper_binary,
+        model_path=model_path,
+        extra_whisper_args=extra_whisper_args,
+        line_kind=line_kind,
+        debounce_ms=debounce_ms,
+        min_interval_ms=min_interval_ms,
+        dry_run=dry_run,
+        verbose=verbose,
     )
-
-    if dry_run:
-        click.echo(shell_cmd)
-        return
-
-    if verbose:
-        logging.basicConfig(level=logging.INFO)
-
-    async def _run() -> None:
-        await run_pulse_caption_pipeline(
-            channel=ch,
-            publisher_token=tok,
-            shell_command=shell_cmd,
-            line_kind=line_kind,
-            debounce_ms=debounce_ms,
-            min_interval_ms=min_interval_ms,
-            quiet_ably_logs=not verbose,
-        )
-
-    try:
-        asyncio.run(_run())
-    except KeyboardInterrupt:
-        click.echo("", err=True)

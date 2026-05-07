@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import logging
+import os
+import pty
 import re
 import shlex
+import struct
 import sys
+import termios
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 
@@ -16,6 +21,25 @@ from ably.types.connectionstate import ConnectionState
 from captions_relay.config import CAPTION_EVENT
 
 log = logging.getLogger(__name__)
+
+# Read pty master in chunks. Whisper uses `\r` + CSI when stdout is a TTY; with a bare pipe
+# it falls back to newline logging (duplicated “growing” lines), so we attach a PTY to stdout.
+_PULSE_WHISPER_READ_CHUNK = 16384
+
+
+def _pulse_pty_set_winsize(slave_fd: int) -> None:
+    """Size the slave PTY like our stderr terminal so whisper’s layout matches an interactive run."""
+    try:
+        if sys.stderr.isatty():
+            dim = os.get_terminal_size(sys.stderr.fileno())
+            rows, cols = dim.lines, dim.columns
+        else:
+            rows, cols = 24, 80
+        winsize = struct.pack("HHHH", rows, cols, 0, 0)
+        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
+    except OSError:
+        pass
+
 
 # whisper.cpp streaming uses CSI sequences (e.g. ESC [ 2 K clear line) and CR rewrites.
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -225,6 +249,7 @@ async def run_pulse_caption_pipeline(
     debounce_ms: int,
     min_interval_ms: int,
     quiet_ably_logs: bool,
+    verbose_echo_whisper: bool = False,
 ) -> int:
     if sys.platform == "win32":
         raise RuntimeError("pulse capture is Unix-only; use WSL or a different audio source.")
@@ -242,29 +267,74 @@ async def run_pulse_caption_pipeline(
 
     proc: asyncio.subprocess.Process | None = None
     exit_code = 0
+    transport: asyncio.BaseTransport | None = None
+    master_fd: int | None = None
+    slave_fd: int | None = None
     try:
         await wait_ably_connected(realtime)
 
+        master_fd, slave_fd = pty.openpty()
+        _pulse_pty_set_winsize(slave_fd)
         proc = await asyncio.create_subprocess_shell(
             shell_command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=None,
             stdin=asyncio.subprocess.DEVNULL,
+            stdout=slave_fd,
+            stderr=None,
             start_new_session=True,
         )
+        os.close(slave_fd)
+        slave_fd = None
 
-        assert proc.stdout is not None
-        log.info("Started ffmpeg | whisper pipeline (pid %s)", proc.pid)
+        loop = asyncio.get_running_loop()
+        reader = asyncio.StreamReader()
+        pipe_f = os.fdopen(master_fd, "rb", buffering=0, closefd=True)
+        master_fd = None
+        transport, _ = await loop.connect_read_pipe(
+            lambda: asyncio.StreamReaderProtocol(reader),
+            pipe_f,
+        )
 
+        if not verbose_echo_whisper:
+            log.info("Started ffmpeg | whisper pipeline (pid %s, whisper stdout is a PTY)", proc.pid)
+
+        pending = bytearray()
         while True:
-            raw = await proc.stdout.readline()
-            if not raw:
+            chunk = await reader.read(_PULSE_WHISPER_READ_CHUNK)
+            if not chunk:
                 break
-            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
-            if not line:
-                continue
-            await throttle.push(line, line_kind)
+            if verbose_echo_whisper:
+                sys.stderr.buffer.write(chunk)
+                sys.stderr.buffer.flush()
+            pending.extend(chunk)
+            while True:
+                nl = pending.find(b"\n")
+                if nl < 0:
+                    break
+                line_bytes = bytes(pending[:nl])
+                del pending[: nl + 1]
+                text = line_bytes.decode("utf-8", errors="replace")
+                line = text.rstrip("\r\n")
+                if line:
+                    await throttle.push(line, line_kind)
+
+        if pending:
+            text = bytes(pending).decode("utf-8", errors="replace")
+            line = text.rstrip("\r\n")
+            if line:
+                await throttle.push(line, line_kind)
     finally:
+        if slave_fd is not None:
+            try:
+                os.close(slave_fd)
+            except OSError:
+                pass
+        if master_fd is not None:
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+        if transport is not None:
+            transport.close()
         await throttle.aclose()
         if proc is not None and proc.returncode is None:
             proc.terminate()
@@ -277,7 +347,7 @@ async def run_pulse_caption_pipeline(
 
     if proc is not None:
         exit_code = proc.returncode if proc.returncode is not None else 0
-        if exit_code != 0:
+        if exit_code != 0 and not verbose_echo_whisper:
             log.info("ffmpeg | whisper exited with code %s", exit_code)
 
     return exit_code
