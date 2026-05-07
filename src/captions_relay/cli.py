@@ -6,12 +6,18 @@ import logging
 import os
 import shlex
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import click
 from ably.sync.util.exceptions import AblyException
 
-from captions_relay.ably_tokens import mint_publisher_token, mint_subscriber_token
+from captions_relay.ably_tokens import (
+    list_active_channel_names,
+    mint_publisher_token,
+    mint_subscriber_token,
+    publish_session_end_marker,
+)
 from captions_relay.config import (
     CAPTION_EVENT,
     ENV_PUBLISHER_TOKEN,
@@ -22,18 +28,27 @@ from captions_relay.config import (
     WHISPER_CPP_DEFAULT_MODEL,
     WHISPER_CPP_REL_BINARY,
     WHISPER_CPP_REL_MODELS_DIR,
-    channel_for_session,
     normalize_caption_channel,
+    subscriber_index_url,
 )
 from captions_relay.pulse_captions import build_pulse_pipeline_command, run_pulse_caption_pipeline
 
 PACKAGE_VERSION = "0.1.0"
 
-WEB_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "web"))
-
 
 def _default_ttl() -> int:
     return int(os.environ.get(ENV_TOKEN_TTL, "14400"))
+
+
+def _channel_for_session_new(channel: str | None) -> str:
+    """Default ``captions:<uuidhex>`` or a caller-provided Ably channel name."""
+    raw = (channel or "").strip()
+    if not raw:
+        return f"captions:{uuid.uuid4().hex}"
+    try:
+        return normalize_caption_channel(raw)
+    except ValueError as e:
+        raise click.BadParameter(str(e), param_hint="channel") from e
 
 
 @click.group(invoke_without_command=True, context_settings={"help_option_names": ["-h", "--help"]})
@@ -47,7 +62,7 @@ def main(ctx: click.Context) -> None:
 
 @main.group()
 def session() -> None:
-    """Create caption sessions."""
+    """Manage caption sessions (create, list active channels, end)."""
 
 
 @session.command("new")
@@ -61,35 +76,39 @@ def session() -> None:
     "--json",
     "as_json",
     is_flag=True,
-    help="Print machine-readable JSON (channel, session_id, tokens).",
+    help="Print machine-readable JSON (channel, subscriber_url, tokens).",
 )
-def session_new(ttl: int | None, as_json: bool) -> None:
-    """Generate a new session id, channel name, and short-lived publisher/subscriber tokens."""
+@click.option(
+    "--channel",
+    type=str,
+    default=None,
+    help="Ably channel name; default: random captions:<uuidhex>.",
+)
+def session_new(ttl: int | None, as_json: bool, channel: str | None) -> None:
+    """Generate a channel name and short-lived publisher/subscriber tokens."""
     ttl_eff = ttl if ttl is not None else _default_ttl()
-    sid = uuid.uuid4().hex
-    channel = channel_for_session(sid)
+    channel = _channel_for_session_new(channel)
     try:
-        pub = mint_publisher_token(sid, ttl_eff)
-        sub = mint_subscriber_token(sid, ttl_eff)
+        pub = mint_publisher_token(channel, ttl_eff)
+        sub = mint_subscriber_token(channel, ttl_eff)
     except AblyException as e:
         raise click.ClickException(f"Ably error: {e}") from e
     except ValueError as e:
         raise click.ClickException(str(e)) from e
 
     if as_json:
+        sub_url = subscriber_index_url(channel)
         payload = {
-            "session_id": sid,
             "channel": channel,
             "caption_event": CAPTION_EVENT,
             "ttl_seconds": ttl_eff,
+            "subscriber_url": sub_url,
             "publisher_token": pub.token,
             "subscriber_token": sub.token,
         }
         click.echo(json.dumps(payload, indent=2))
         return
 
-    subscriber_path = "/subscriber/index.html"
-    click.echo(f"session_id:  {sid}")
     click.echo(f"channel:     {channel}")
     click.echo(f"event:       {CAPTION_EVENT}")
     click.echo(f"ttl:         {ttl_eff}s (~{ttl_eff // 3600}h)" if ttl_eff >= 3600 else f"ttl:         {ttl_eff}s")
@@ -107,14 +126,114 @@ def session_new(ttl: int | None, as_json: bool) -> None:
     click.echo(click.style("subscriber_token:", bold=True))
     click.echo(sub.token)
     click.echo("")
-    click.echo("Subscriber URL (serve web/ locally, see README):")
-    click.echo(f"  http://localhost:8765{subscriber_path}?channel={channel}")
-    click.echo(f"WEB_DIR={WEB_DIR}")
+    click.echo("Subscriber URL:")
+    click.echo(f"  {subscriber_index_url(channel)}")
+
+
+@session.command("delete")
+@click.argument("channel")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Validate channel and print the payload; do not publish.",
+)
+def session_delete(channel: str, dry_run: bool) -> None:
+    """Publish a session-end marker so subscribers stop (``ended: true`` on the caption event).
+
+    Ably does not delete channel resources; existing tokens work until they expire. Requires a key
+    with **publish** on this channel (your facilitator root key).
+    """
+    try:
+        ch = normalize_caption_channel(channel)
+    except ValueError as e:
+        raise click.BadParameter(str(e), param_hint="channel") from e
+
+    body = {
+        "t": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "text": "",
+        "kind": "final",
+        "ended": True,
+    }
+    if dry_run:
+        click.echo(json.dumps({"channel": ch, "event": CAPTION_EVENT, "data": body}, indent=2))
+        click.echo("(dry run — nothing published)")
+        return
+
+    try:
+        publish_session_end_marker(ch)
+    except AblyException as e:
+        raise click.ClickException(f"Ably error: {e}") from e
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+
+    click.echo(f"Published session-end marker on {ch!r} (event {CAPTION_EVENT!r}).")
+    click.echo(
+        click.style(
+            "Tokens already issued for this channel remain valid until TTL. "
+            'Subscribers should disconnect; updated web subscriber shows "Session ended by host".',
+            fg="yellow",
+        )
+    )
+
+
+@session.command("list")
+@click.option(
+    "--prefix",
+    type=str,
+    default=None,
+    help="Only channels whose names start with this prefix (e.g. captions:).",
+)
+@click.option(
+    "--limit",
+    type=int,
+    default=100,
+    show_default=True,
+    help="Page size (Ably allows up to 1000).",
+)
+@click.option(
+    "--all-pages",
+    "fetch_all_pages",
+    is_flag=True,
+    help="Follow pagination until there is no next page (capped internally).",
+)
+@click.option("--json", "as_json", is_flag=True, help="Print a JSON array of channel names.")
+def session_list(
+    prefix: str | None,
+    limit: int,
+    fetch_all_pages: bool,
+    as_json: bool,
+) -> None:
+    """List **active** Ably channels (must have been in use recently).
+
+    Needs **channel-metadata** on ``*`` — use your app root key unless a restricted key includes that scope.
+    """
+    if limit < 1 or limit > 1000:
+        raise click.BadParameter("limit must be 1–1000", param_hint="limit")
+    try:
+        names = list_active_channel_names(
+            limit=limit,
+            prefix=prefix,
+            fetch_all_pages=fetch_all_pages,
+        )
+    except AblyException as e:
+        raise click.ClickException(f"Ably error: {e}") from e
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+
+    if as_json:
+        click.echo(json.dumps(names, indent=2))
+        return
+
+    if not names:
+        click.echo("(no active channels in this page; try --all-pages or a different --prefix)")
+        return
+    for n in names:
+        click.echo(n)
 
 
 @main.group()
 def tokens() -> None:
-    """Mint tokens for an existing session."""
+    """Mint tokens for an Ably channel."""
 
 
 def _ttl_option():
@@ -126,18 +245,18 @@ def _ttl_option():
     )
 
 
-def _session_arg() -> callable:
-    return click.argument("session_id")
+def _channel_arg() -> callable:
+    return click.argument("channel")
 
 
 @tokens.command("publisher")
-@_session_arg()
+@_channel_arg()
 @_ttl_option()
-def tokens_publisher(session_id: str, ttl: int | None) -> None:
+def tokens_publisher(channel: str, ttl: int | None) -> None:
     """Emit a publisher token (stdout only)."""
     ttl_eff = ttl if ttl is not None else _default_ttl()
     try:
-        token = mint_publisher_token(session_id.strip(), ttl_eff).token
+        token = mint_publisher_token(channel.strip(), ttl_eff).token
     except AblyException as e:
         raise click.ClickException(f"Ably error: {e}") from e
     except ValueError as e:
@@ -146,13 +265,13 @@ def tokens_publisher(session_id: str, ttl: int | None) -> None:
 
 
 @tokens.command("subscriber")
-@_session_arg()
+@_channel_arg()
 @_ttl_option()
-def tokens_subscriber(session_id: str, ttl: int | None) -> None:
+def tokens_subscriber(channel: str, ttl: int | None) -> None:
     """Emit a subscriber token (stdout only)."""
     ttl_eff = ttl if ttl is not None else _default_ttl()
     try:
-        token = mint_subscriber_token(session_id.strip(), ttl_eff).token
+        token = mint_subscriber_token(channel.strip(), ttl_eff).token
     except AblyException as e:
         raise click.ClickException(f"Ably error: {e}") from e
     except ValueError as e:
@@ -193,20 +312,11 @@ def _resolve_whisper_paths_from_home(
     return wb, mp
 
 
-def _resolve_publisher_channel(session_id: str | None, channel: str | None) -> str:
-    if session_id and channel:
-        raise click.UsageError("Use only one of --session-id or --channel.")
-    if session_id:
-        try:
-            return channel_for_session(session_id)
-        except ValueError as e:
-            raise click.BadParameter(str(e), param_hint="session_id") from e
-    if channel:
-        try:
-            return normalize_caption_channel(channel)
-        except ValueError as e:
-            raise click.BadParameter(str(e), param_hint="channel") from e
-    raise click.UsageError("Provide --session-id or --channel.")
+def _normalize_cli_channel(channel: str, *, param_hint: str) -> str:
+    try:
+        return normalize_caption_channel(channel)
+    except ValueError as e:
+        raise click.BadParameter(str(e), param_hint=param_hint) from e
 
 
 @main.group()
@@ -216,16 +326,10 @@ def whisper() -> None:
 
 @whisper.command("pulse")
 @click.option(
-    "--session-id",
-    type=str,
-    default=None,
-    help="Session id from session new (alternative to --channel).",
-)
-@click.option(
     "--channel",
     type=str,
-    default=None,
-    help="captions:<hex> channel string (alternative to --session-id).",
+    required=True,
+    help="Ably channel name.",
 )
 @click.option(
     "--publisher-token",
@@ -301,8 +405,7 @@ def whisper() -> None:
 )
 @click.option("-v", "--verbose", is_flag=True, help="Enable INFO logging.")
 def whisper_pulse(
-    session_id: str | None,
-    channel: str | None,
+    channel: str,
     publisher_token: str | None,
     ffmpeg_bin: str,
     pulse_device: str,
@@ -322,7 +425,7 @@ def whisper_pulse(
     verbose: bool,
 ) -> None:
     """PulseAudio → ffmpeg (WAV) → whisper-stream-pcm; publish stdout lines to Ably."""
-    ch = _resolve_publisher_channel(session_id, channel)
+    ch = _normalize_cli_channel(channel, param_hint="channel")
 
     wb, mp = _resolve_whisper_paths_from_home(whisper_cpp_home, whisper_binary, model_path)
 

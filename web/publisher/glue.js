@@ -3,38 +3,70 @@
  *
  * Usage after `connect()`:
  *   const pub = new CaptionsAblyPublisher();
- *   await pub.connect({ channel: 'captions:…', token: '<publisher token>' });
+ *   await pub.connect({ channel: '<Ably channel name>', token: '<publisher token>' });
  *   pub.publishCaption({ text: 'hello', kind: 'partial' });
  *
  * From whisper: call publishCaption on each model update; coalescing runs internally.
+ * You may send raw whisper/terminal-style chunks (CSI/OSC escapes, CR rewrites); the
+ * subscriber normalizes them the same way as the CLI pipeline’s TTY handling.
  */
 
-/** Match tokens minted by the CLI (`captions:` + lowercase hex; dashed UUID collapses here). */
-function normalizeCaptionChannel(raw) {
+/** Ably channel naming (matches ``captions_relay.config``). */
+const MAX_CHANNEL_LEN = 2048;
+
+function validateAblyChannelName(name) {
+  const channel = String(name ?? "").trim();
+  if (!channel) {
+    throw new Error("Channel name must be non-empty.");
+  }
+  if (channel.includes("\n") || channel.includes("\r")) {
+    throw new Error("Channel name must not contain newline characters.");
+  }
+  if (channel.startsWith("[") || channel.startsWith(":")) {
+    throw new Error("Channel name must not start with '[' or ':'.");
+  }
+  if (channel.length > MAX_CHANNEL_LEN) {
+    throw new Error(`Channel name must be at most ${MAX_CHANNEL_LEN} characters.`);
+  }
+  const ns = channel.split(":", 1)[0];
+  if (ns.includes("*")) {
+    throw new Error("Channel namespace (before the first ':') must not contain '*'.");
+  }
+  return channel;
+}
+
+function extractChannelFromInput(raw) {
   let s = String(raw ?? "").trim();
-  const idx = s.indexOf("captions:");
-  if (idx > 0) {
-    s = s.slice(idx);
+  if (!s) {
+    return s;
   }
-  const m = /^captions:([a-fA-F0-9-]+)$/.exec(s);
-  if (!m) {
-    throw new Error(
-      "Channel must be exactly captions:<session_hex> from `captions session new` (hex only after the colon). " +
-        "Example: captions:591d0445c9494c0dbf4891b54278ca92 — no spaces, prefixes, or query junk."
-    );
+  const lower = s.toLowerCase();
+  if (lower.includes("channel=") || lower.includes("channel%3d")) {
+    try {
+      if (lower.startsWith("http://") || lower.startsWith("https://")) {
+        const u = new URL(s);
+        const c = u.searchParams.get("channel");
+        if (c && c.trim()) {
+          return c.trim();
+        }
+      }
+    } catch (_) {
+      /* ignore */
+    }
+    const m = s.match(/[#?&]channel=([^&#]+)/i);
+    if (m) {
+      return decodeURIComponent(m[1]).trim();
+    }
   }
-  const slug = m[1].replace(/-/g, "").toLowerCase();
-  if (!/^[0-9a-f]+$/.test(slug)) {
-    throw new Error(
-      "Channel slug after captions: must be hexadecimal (optional hyphens allowed for UUID)."
-    );
+  return s;
+}
+
+function normalizeCaptionChannel(raw) {
+  const s = extractChannelFromInput(raw);
+  if (!s) {
+    throw new Error("Channel name must be non-empty.");
   }
-  if (slug === "cap") {
-    throw new Error(
-      'Channel "captions:cap" is not a session id — paste the full channel from `captions session new` (captions: plus 32 hex digits).'
-    );
-  }
-  return `captions:${slug}`;
+  return validateAblyChannelName(s);
 }
 
 class CaptionsAblyPublisher {

@@ -1,7 +1,10 @@
 """Environment and shared settings."""
 
+from __future__ import annotations
+
 import os
 import re
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 ENV_API_KEY = "CAPTIONS_ABLY_API_KEY"
 ENV_PUBLISHER_TOKEN = "CAPTIONS_PUBLISHER_TOKEN"
@@ -9,12 +12,17 @@ ENV_TOKEN_TTL = "CAPTIONS_TOKEN_TTL"
 ENV_WHISPER_BINARY = "CAPTIONS_WHISPER_STREAM_PCM"
 ENV_WHISPER_MODEL = "CAPTIONS_WHISPER_MODEL"
 ENV_WHISPER_CPP_HOME = "WHISPER_CPP_HOME"
+ENV_SUBSCRIBER_PAGES_BASE = "CAPTIONS_SUBSCRIBER_PAGES_BASE"
 
 CAPTION_EVENT = "caption"
 
 WHISPER_CPP_REL_BINARY = ("build", "bin", "whisper-stream-pcm")
 WHISPER_CPP_REL_MODELS_DIR = "models"
 WHISPER_CPP_DEFAULT_MODEL = "ggml-base.bin"
+
+# Ably: non-empty, no newlines, must not start with '[' or ':', namespace (before
+# first ':') must not contain '*'; practical URL length.
+_MAX_CHANNEL_LEN = 2048
 
 
 def get_ably_api_key() -> str:
@@ -26,41 +34,62 @@ def get_ably_api_key() -> str:
     return key
 
 
-def channel_for_session(session_id: str) -> str:
-    sid = session_id.strip()
-    if not sid:
-        raise ValueError("session id must be non-empty")
-    if ":" in sid:
-        raise ValueError("session id must not contain ':'; use bare UUID or hex id")
-    # Capability keys match the literal channel string. Normalize dashed UUID forms to
-    # the same lowercase 32‑hex slug as session new (uuid.uuid4().hex).
-    condensed = "".join(sid.lower().split("-"))
-    if not condensed or not re.fullmatch(r"[0-9a-f]+", condensed):
-        raise ValueError("session id must be hexadecimal only (hyphens OK for UUIDs)")
-    if condensed == "cap":
-        raise ValueError(
-            "\"cap\" is not a session id — use the hex from `session new` (typically 32 characters)."
-        )
-    return f"captions:{condensed}"
+_DEFAULT_SUBSCRIBER_PAGES_BASE = "https://theotternews.github.io/captions"
+
+
+def subscriber_pages_base_url() -> str:
+    """Root URL of the static subscriber site (GitHub Pages from ``/docs`` by default)."""
+    raw = (
+        os.environ.get(ENV_SUBSCRIBER_PAGES_BASE) or _DEFAULT_SUBSCRIBER_PAGES_BASE
+    ).strip()
+    return raw.rstrip("/")
+
+
+def subscriber_index_url(channel: str) -> str:
+    """Full subscriber page URL with ``channel`` query (percent-encoded)."""
+    q = quote(channel, safe="")
+    return f"{subscriber_pages_base_url()}/subscriber/index.html?channel={q}"
+
+
+def validate_ably_channel_name(name: str) -> str:
+    """Check Ably channel naming rules (see https://ably.com/docs/channels )."""
+    channel = (name or "").strip()
+    if not channel:
+        raise ValueError("Channel name must be non-empty.")
+    if "\n" in channel or "\r" in channel:
+        raise ValueError("Channel name must not contain newline characters.")
+    if channel.startswith("[") or channel.startswith(":"):
+        raise ValueError("Channel name must not start with '[' or ':'.")
+    if len(channel) > _MAX_CHANNEL_LEN:
+        raise ValueError(f"Channel name must be at most {_MAX_CHANNEL_LEN} characters.")
+    ns = channel.split(":", 1)[0]
+    if "*" in ns:
+        raise ValueError("Channel namespace (before the first ':') must not contain '*'.")
+    return channel
+
+
+def _extract_channel_from_input(raw: str) -> str:
+    """Pull channel=… out of pasted subscriber URLs; otherwise strip."""
+    s = (raw or "").strip()
+    if not s:
+        return s
+    lower = s.lower()
+    if "channel=" in lower or "channel%3d" in lower:
+        if lower.startswith("http://") or lower.startswith("https://"):
+            q = parse_qs(urlparse(s).query)
+            vals = q.get("channel") or q.get("CHANNEL")
+            if vals and vals[0].strip():
+                return unquote(vals[0]).strip()
+        m = re.search(r"(?i)[#?&]channel=([^&#]+)", s)
+        if m:
+            return unquote(m.group(1)).strip()
+    return s
 
 
 def normalize_caption_channel(raw: str) -> str:
-    """Normalize `captions:<hex>` the same way as `web/subscriber` and `glue.js`."""
-    s = (raw or "").strip()
-    idx = s.find("captions:")
-    if idx > 0:
-        s = s[idx:]
-    m = re.fullmatch(r"captions:([a-fA-F0-9\-]+)", s)
-    if not m:
-        raise ValueError(
-            "Channel must be captions:<session_hex> from `session new` "
-            "(hex only after the colon; optional hyphens)."
-        )
-    slug = m.group(1).replace("-", "").lower()
-    if not slug or not re.fullmatch(r"[0-9a-f]+", slug):
-        raise ValueError("Channel slug after captions: must be hexadecimal.")
-    if slug == "cap":
-        raise ValueError(
-            '"captions:cap" is not valid — use the full captions:… channel from `session new`.'
-        )
-    return f"captions:{slug}"
+    """Extract ``channel`` from a pasted URL if needed, then validate as an Ably channel name."""
+    s = _extract_channel_from_input(raw)
+    if not s:
+        raise ValueError("Channel name must be non-empty.")
+    return validate_ably_channel_name(s)
+

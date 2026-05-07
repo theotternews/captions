@@ -144,31 +144,61 @@
       el.status.className = cls || "";
     }
 
-    function normalizeCaptionChannel(raw) {
+    const MAX_CHANNEL_LEN = 2048;
+
+    function validateAblyChannelName(name) {
+      const channel = String(name ?? "").trim();
+      if (!channel) {
+        throw new Error("Channel name must be non-empty.");
+      }
+      if (channel.includes("\n") || channel.includes("\r")) {
+        throw new Error("Channel name must not contain newline characters.");
+      }
+      if (channel.startsWith("[") || channel.startsWith(":")) {
+        throw new Error("Channel name must not start with '[' or ':'.");
+      }
+      if (channel.length > MAX_CHANNEL_LEN) {
+        throw new Error(`Channel name must be at most ${MAX_CHANNEL_LEN} characters.`);
+      }
+      const ns = channel.split(":", 1)[0];
+      if (ns.includes("*")) {
+        throw new Error("Channel namespace (before the first ':') must not contain '*'.");
+      }
+      return channel;
+    }
+
+    function extractChannelFromInput(raw) {
       let s = String(raw ?? "").trim();
-      const idx = s.indexOf("captions:");
-      if (idx > 0) {
-        s = s.slice(idx);
+      if (!s) {
+        return s;
       }
-      const m = /^captions:([a-fA-F0-9]+)$/.exec(s);
-      if (!m) {
-        throw new Error(
-          'Bad channel. Use subscriber URL …?channel=captions:' +
-            "<session_hex> where session_hex matches session new output (digits a–f only; hyphenated UUID is OK)."
-        );
+      const lower = s.toLowerCase();
+      if (lower.includes("channel=") || lower.includes("channel%3d")) {
+        try {
+          if (lower.startsWith("http://") || lower.startsWith("https://")) {
+            const u = new URL(s);
+            const c = u.searchParams.get("channel");
+            if (c && c.trim()) {
+              return c.trim();
+            }
+          }
+        } catch (_) {
+          /* ignore */
+        }
+        const m = s.match(/[#?&]channel=([^&#]+)/i);
+        if (m) {
+          return decodeURIComponent(m[1]).trim();
+        }
       }
-      const slug = m[1].replace(/-/g, "").toLowerCase();
-      if (!/^[0-9a-f]+$/.test(slug)) {
-        throw new Error(
-          "Channel slug after captions: must be hexadecimal (optional hyphens allowed for UUID)."
-        );
+      return s;
+    }
+
+    function normalizeCaptionChannel(raw) {
+      const s = extractChannelFromInput(raw);
+      if (!s) {
+        throw new Error("Channel name must be non-empty.");
       }
-      if (slug === "cap") {
-        throw new Error(
-          'Channel "captions:cap" is not a session id — paste the full captions:… channel from session new.'
-        );
-      }
-      return `captions:${slug}`;
+      return validateAblyChannelName(s);
     }
 
     /** Raw channel from ?channel= query (preferred) or last saved sessionStorage. */
@@ -183,13 +213,47 @@
     function resolveChannelOrError() {
       const raw = currentChannelRaw();
       if (!raw) {
-        return { error: "Missing ?channel=captions:… in URL", channel: "" };
+        return { error: "Missing ?channel=… in URL", channel: "" };
       }
       try {
         return { error: null, channel: normalizeCaptionChannel(raw) };
       } catch (e) {
         return { error: e.message || String(e), channel: "" };
       }
+    }
+
+    const ANSI_CSI_RE = /\x1b\[[0-?]*[ -/]*[@-~]/g;
+    const ANSI_OSC_RE = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
+
+    /** Match `pulse_captions.normalize_whisper_stdout_line` (whisper TTY stdout). */
+    function collapseRedundantPrefixRepeat(s, minPrefix) {
+      let t = s;
+      while (t.length >= minPrefix * 2) {
+        let cut = null;
+        for (let i = minPrefix; i < t.length; i++) {
+          const prefix = t.slice(0, i);
+          const rest = t.slice(i);
+          if (rest.startsWith(prefix)) {
+            cut = i;
+            break;
+          }
+        }
+        if (cut == null) {
+          break;
+        }
+        t = t.slice(cut);
+      }
+      return t;
+    }
+
+    function normalizeWhisperStdoutLine(raw, minDupPrefix = 4) {
+      let s = String(raw ?? "").replace(ANSI_OSC_RE, "").replace(ANSI_CSI_RE, "");
+      if (s.includes("\r")) {
+        const parts = s.split("\r");
+        s = parts[parts.length - 1] ?? "";
+      }
+      s = collapseRedundantPrefixRepeat(s.trim(), minDupPrefix);
+      return s.trim();
     }
 
     function captionPayload(raw) {
@@ -208,7 +272,14 @@
 
     function applyCaption(msg) {
       const data = captionPayload(msg.data);
-      const text = (data && data.text) || "";
+      if (data && data.ended === true) {
+        setStatus("Session ended by host", "warn");
+        el.current.textContent = "";
+        el.current.classList.remove("partial");
+        return;
+      }
+      const raw = (data && data.text) || "";
+      const text = normalizeWhisperStdoutLine(raw);
       const kind = (data && data.kind) === "final" ? "final" : "partial";
       if (kind === "final") {
         if (el.current.textContent) {

@@ -127,7 +127,7 @@
   <main>
     <h1>Live captions subscriber</h1>
     <p class="lede">
-      Receive caption lines broadcast from your facilitator’s session over Ably. You need the subscriber token and the session channel (<code>captions:…</code>) from <code>captions session new</code>.
+      Receive caption lines broadcast from your facilitator’s session over Ably. You need the subscriber token and the <strong>channel</strong> name from <code>captions session new</code>.
     </p>
 
     <section aria-labelledby="open-heading">
@@ -139,7 +139,7 @@
         autocomplete="off"
         autocapitalize="off"
         spellcheck="false"
-        placeholder="captions:591d0445… or full subscriber URL query"
+        placeholder="captions:…, my-app:room, or full subscriber URL"
       />
       <button type="button" class="primary" id="open-btn">Open subscriber page</button>
       <p class="hint" id="preview"></p>
@@ -167,7 +167,7 @@
       const baseSubscriber = new URL("./subscriber/index.html", location.href).href.split("?")[0];
       const patternEl = document.getElementById("pattern");
       patternEl.textContent =
-        baseSubscriber + "?channel=captions:YOUR_SESSION_HEX";
+        baseSubscriber + "?channel=YOUR_CHANNEL";
 
       const channelInput = document.getElementById("channel");
       const preview = document.getElementById("preview");
@@ -186,7 +186,7 @@
       function openSubscriber() {
         const raw = stripChannelFromPaste(channelInput.value);
         if (!raw) {
-          preview.textContent = "Enter a captions:… channel or paste a subscriber URL.";
+          preview.textContent = "Enter a channel name or paste a subscriber URL.";
           channelInput.focus();
           return;
         }

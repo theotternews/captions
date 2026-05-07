@@ -25,9 +25,8 @@ _ANSI_OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 def normalize_whisper_stdout_line(raw: str, *, min_dup_prefix: int = 4) -> str:
     """Turn TTY-oriented whisper stdout into plain caption text.
 
-    Strips ANSI escapes, applies carriage-return overwrite semantics, and removes one
-    common amendment artifact: ``prefix + ESC[2K + prefix + rest`` becomes ``prefix + rest``
-    once escapes are removed (``prefixprefixrest`` → collapse).
+    Reference implementation mirrored in `web/subscriber` (and `docs/subscriber`).
+    The pulse → Ably path publishes **raw** stdout lines so subscribers can normalize.
     """
     s = _ANSI_OSC_RE.sub("", raw)
     s = _ANSI_CSI_RE.sub("", s)
@@ -261,7 +260,7 @@ async def run_pulse_caption_pipeline(
             raw = await proc.stdout.readline()
             if not raw:
                 break
-            line = normalize_whisper_stdout_line(raw.decode("utf-8", errors="replace"))
+            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
             if not line:
                 continue
             await throttle.push(line, line_kind)

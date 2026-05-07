@@ -17,6 +17,8 @@ export CAPTIONS_ABLY_API_KEY='your_app_id.key_id:secret'
 
 Keep the root key **only** on the facilitator’s machine (or a future token broker). Browsers get **short-lived tokens** from the CLI.
 
+Optional: `CAPTIONS_SUBSCRIBER_PAGES_BASE` — root URL printed for subscribers (default: hosted GitHub Pages site from this project’s `docs/`). Set this if your fork uses a different static host.
+
 ## Create a session
 
 ```bash
@@ -31,7 +33,9 @@ uv run captions session new --json
 
 This prints:
 
-- `session_id` and `channel` (`captions:<hex>`)
+- **`channel`** — Ably channel name (default new sessions use `captions:<random uuid hex>`)
+- **Subscriber URL** — ready-to-open link to the static subscriber page (GitHub Pages by default; override with `CAPTIONS_SUBSCRIBER_PAGES_BASE`)
+- With **`--json`**: same link as **`subscriber_url`**
 - **`publisher_token`** — **secret**; used in the tab that runs captioning / whisper
 - **`subscriber_token`** — share with Deaf / processing-access participants
 - Default TTL **4 hours** (override with `--ttl` or env `CAPTIONS_TOKEN_TTL`)
@@ -39,13 +43,33 @@ This prints:
 Refresh tokens only:
 
 ```bash
-uv run captions tokens publisher <session_id>
-uv run captions tokens subscriber <session_id>
+uv run captions tokens publisher <channel>
+uv run captions tokens subscriber <channel>
 ```
+
+End a session (subscribers see **Session ended by host** on the static subscriber page):
+
+```bash
+uv run captions session delete <channel>
+```
+
+Uses your **root** API key to publish a final `caption` message with `ended: true`. Ably does not erase the channel; tokens already minted still expire on schedule. Use **`--dry-run`** to inspect the payload without publishing.
+
+List channels that Ably currently considers **active** (recently used):
+
+```bash
+uv run captions session list
+uv run captions session list --prefix 'captions:'
+uv run captions session list --json
+```
+
+Needs **channel-metadata** on `*` for your API key (root keys usually do). This is rate-limited; one page is returned by default — use **`--all-pages`** to follow Ably’s `next` links (still capped).
 
 ## Serve the static web UI
 
-Ably uses WebSockets from `https` or `http://localhost`. Open the pages via a **local static server** (not `file://`):
+Subscribers can use the **subscriber URL** from `session new` (GitHub Pages by default).
+
+For local development, Ably accepts `http://localhost`. Serve `web/` with a static server (not `file://`):
 
 ```bash
 cd web
@@ -53,8 +77,8 @@ python -m http.server 8765
 ```
 
 - **Subscribers (phones / second screen):**  
-  `http://localhost:8765/subscriber/index.html?channel=captions:YOUR_SESSION_HEX`  
-  Paste the **subscriber** token, tap **Save & connect**.
+  `http://localhost:8765/subscriber/index.html?channel=YOUR_CHANNEL`  
+  Use the exact **`channel`** string from `session new` in the query (URL-encode if needed). Paste the **subscriber** token, tap **Save & connect**.
 
 - **Facilitator test publisher (no whisper):**  
   `http://localhost:8765/publisher/index.html`  
@@ -75,7 +99,7 @@ For phones on the same LAN, use your machine’s LAN IP instead of `localhost`.
 
 ```javascript
 await connectCaptionsPublisher({
-  channel: "captions:…………",
+  channel: "<channel from session new>",
   token: "<publisher_token>",
 });
 ```
@@ -88,6 +112,8 @@ publishCaption({
   kind: isFinal ? "final" : "partial",
 });
 ```
+
+You can pass **raw whisper-style stdout** in `text` (ANSI CSI/OSC, carriage-return rewrites). Subscribers strip escapes and apply the same “last `\r` segment + duplicate-prefix collapse” rules as the Python helper `normalize_whisper_stdout_line`.
 
 Or use the class directly for more control:
 
@@ -107,10 +133,12 @@ Linux only: capture from PulseAudio, run **`whisper-stream-pcm`**, and publish t
 export CAPTIONS_PUBLISHER_TOKEN='<publisher_token from session new>'
 export WHISPER_CPP_HOME=/path/to/whisper.cpp   # defaults: build/bin/whisper-stream-pcm, models/ggml-base.bin
 
-uv run captions whisper pulse --session-id YOUR_SESSION_HEX -v
+uv run captions whisper pulse --channel '<channel from session new>' -v
 ```
 
 Use **`--dry-run`** to print the resolved `ffmpeg | whisper-stream-pcm` shell command without Ably or audio. Paths can be overridden with `--whisper-binary`, `-m` / `--model`, or env **`CAPTIONS_WHISPER_STREAM_PCM`** / **`CAPTIONS_WHISPER_MODEL`**.
+
+**Pulse publishes raw stdout lines** (TTY escapes preserved). Normalization happens in the subscriber page so on-screen edits match what a terminal would show.
 
 ## Two-phone rehearsal checklist
 
@@ -123,7 +151,7 @@ Use **`--dry-run`** to print the resolved `ffmpeg | whisper-stream-pcm` shell co
 
 ## Troubleshooting (both show “connected” but no captions move)
 
-1. **Channel mismatch** — The publisher tab’s channel string must match the subscriber URL `?channel=` for the same session (`captions:` plus the same lowercase session hex — hyphens are ignored; `captions:591d0445…` equals `captions:591d0445-c949-…` after normalization).
+1. **Channel mismatch** — The publisher tab’s channel string must exactly match the subscriber URL `?channel=` value (same spelling and case; Ably channel names are case-sensitive).
 
 2. **Swapped tokens** — Publisher UI needs **`publisher_token`**. Subscriber paste needs **`subscriber_token`**.
 
@@ -133,6 +161,4 @@ Use **`--dry-run`** to print the resolved `ffmpeg | whisper-stream-pcm` shell co
 
 5. **DevTools console** — Publisher logs **`Ably publish failed`** on rejections; subscriber logs **`[captions-relay subscriber]`** for subscribe/attach errors.
 
-6. **`Channel denied access…` / Ably code 40160** — Tokens are capped to your session channel only. Typical causes: the **subscriber** token was pasted into the publisher (no **publish** on that channel); or **`CAPTIONS_ABLY_API_KEY`** is a **restricted** key — minted caps are intersected with the key’s dashboard scope, which can forbid publish entirely. Prefer a default full-access/root key until you carve a dedicated token-minting key with **publish + subscribe** on **`captions:*`** (or the exact channel prefix you use).
-
-7. **`channelId = cap` in an error message** — That usually means the Realtime library is attaching to **`captions:cap`**, almost always because the publisher **channel field was shortened or pasted wrong** (`cap` parses as hexadecimal). Paste the whole **`captions:` + session hex** from `session new` (32 lowercase hex characters after you strip hyphens).
+6. **`Channel denied access…` / Ably code 40160** — Tokens are capped to the channel you minted for. Typical causes: the **subscriber** token was pasted into the publisher (no **publish** on that channel); or **`CAPTIONS_ABLY_API_KEY`** is a **restricted** key — minted caps are intersected with the key’s dashboard scope, which can forbid publish entirely. Prefer a default full-access/root key until you carve a dedicated token-minting key with **publish + subscribe** on the channels or patterns you use (e.g. `captions:*`).
