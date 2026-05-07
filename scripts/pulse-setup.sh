@@ -8,10 +8,11 @@ pactl \
     sink_name=whisper_sink \
     sink_properties=device.description=WhisperLoopback
 
+active=$(pactl list short sinks | grep RUNNING | cut -f 2)
 pactl \
     load-module \
     module-combine-sink \
-    slaves=@DEFAULT_SINK@,whisper_sink \
+    slaves=${active},whisper_sink \
     sink_name=caption_sink \
     sink_properties=device.description=Captions
 

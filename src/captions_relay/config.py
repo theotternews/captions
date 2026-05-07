@@ -18,7 +18,7 @@ CAPTION_EVENT = "caption"
 
 WHISPER_CPP_REL_BINARY = ("build", "bin", "whisper-stream-pcm")
 WHISPER_CPP_REL_MODELS_DIR = "models"
-WHISPER_CPP_DEFAULT_MODEL = "ggml-base.bin"
+WHISPER_CPP_DEFAULT_MODEL = "ggml-base.en-q5_1.bin"
 
 # Ably: non-empty, no newlines, must not start with '[' or ':', namespace (before
 # first ':') must not contain '*'; practical URL length.
