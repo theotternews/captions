@@ -17,9 +17,14 @@
       --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     }
     * { box-sizing: border-box; }
+    html {
+      height: 100%;
+    }
     body {
       margin: 0;
-      min-height: 100dvh;
+      height: 100%;
+      max-height: 100dvh;
+      overflow: hidden;
       background: var(--bg);
       color: var(--fg);
       font-family: var(--font);
@@ -27,22 +32,50 @@
       flex-direction: column;
     }
     header {
+      flex-shrink: 0;
       padding: 0.75rem 1rem;
       border-bottom: 1px solid #27272a;
       font-size: 0.85rem;
       color: var(--muted);
+      background: var(--bg);
+    }
+    .top-bar {
+      display: flex;
+      align-items: center;
+      gap: 0.65rem;
+      flex-wrap: wrap;
+    }
+    #channel-display {
+      color: var(--fg);
+      font-size: inherit;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     #status {
       color: var(--accent);
+      flex: 1 1 auto;
+      min-width: 8rem;
     }
     #status.error { color: var(--err); }
     #status.warn { color: var(--warn); }
+    #disconnect-btn {
+      margin-left: auto;
+      background: #3f3f46;
+      color: #fafafa;
+      flex-shrink: 0;
+      padding-block: 0.45rem;
+    }
     main {
-      flex: 1;
+      flex: 1 1 auto;
       display: flex;
       flex-direction: column;
       padding: 1rem;
       gap: 1rem;
+      min-height: 0;
+      overflow: hidden;
+      background: var(--bg);
     }
     #auth-panel {
       display: flex;
@@ -71,54 +104,83 @@
       cursor: not-allowed;
     }
     #caption-pane {
-      flex: 1;
+      flex: 1 1 auto;
       display: flex;
       flex-direction: column;
-      justify-content: flex-end;
-      min-height: 40vh;
+      min-height: 0;
+      overflow: hidden;
     }
-    #previous {
-      font-size: clamp(1rem, 3.5vw, 1.25rem);
+    #history-scroll {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow-y: auto;
+      overflow-x: hidden;
+      padding: 0.25rem 0.15rem 0.75rem 0;
+      border-bottom: 1px solid #27272a;
+      overscroll-behavior: contain;
+    }
+    #history-lines {
+      display: flex;
+      flex-direction: column;
+      gap: 0.55rem;
+    }
+    #history-lines p {
+      margin: 0;
+      font-size: clamp(0.95rem, 3.2vw, 1.2rem);
       color: var(--muted);
-      line-height: 1.35;
-      min-height: 2.5em;
+      line-height: 1.4;
+      text-wrap: pretty;
+      word-break: break-word;
+    }
+    #history-lines p.history-note {
+      font-size: 0.82rem;
+      font-style: italic;
+      opacity: 0.85;
+    }
+    #current-row {
+      flex-shrink: 0;
+      padding-top: 0.75rem;
     }
     #current {
       font-size: clamp(1.35rem, 6vw, 2.25rem);
       font-weight: 600;
       line-height: 1.3;
       text-wrap: balance;
+      min-height: 1.3em;
     }
     #current.partial::after {
       content: "…";
       color: var(--muted);
       font-weight: 400;
     }
-    footer {
-      font-size: 0.75rem;
-      color: var(--muted);
-      padding: 0.5rem 1rem;
+    #auth-panel.subscriber-online {
+      display: none;
     }
   </style>
 </head>
 <body>
   <header>
-    <div>Channel: <code id="channel-display">—</code></div>
-    <div id="status" class="warn">Disconnected — paste subscriber token below</div>
+    <div class="top-bar">
+      <code id="channel-display">—</code>
+      <div id="status" class="warn">Disconnected — paste subscriber token below</div>
+      <button type="button" id="disconnect-btn" hidden>Disconnect</button>
+    </div>
   </header>
   <main>
     <div id="auth-panel">
       <label for="token-input">Subscriber token (from facilitator)</label>
       <textarea id="token-input" rows="4" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste token…"></textarea>
       <button type="button" id="connect-btn">Save & connect</button>
-      <button type="button" id="clear-btn" style="background:#3f3f46;color:#fafafa;">Clear saved token</button>
     </div>
     <div id="caption-pane">
-      <div id="previous" aria-live="polite"></div>
-      <div id="current" aria-live="assertive" class="partial"></div>
+      <div id="history-scroll" aria-label="Caption scrollback">
+        <div id="history-lines"></div>
+      </div>
+      <div id="current-row">
+        <div id="current" aria-live="assertive" class="partial"></div>
+      </div>
     </div>
   </main>
-  <footer>captions-relay · Ably subscriber</footer>
   <script>
     const CAPTION_EVENT = "caption";
     const STORAGE_TOKEN = "captions_subscriber_token";
@@ -128,14 +190,66 @@
     const channelFromQuery = params.get("channel") || "";
 
     const el = {
+      authPanel: document.getElementById("auth-panel"),
       channelDisplay: document.getElementById("channel-display"),
       status: document.getElementById("status"),
       tokenInput: document.getElementById("token-input"),
       connectBtn: document.getElementById("connect-btn"),
-      clearBtn: document.getElementById("clear-btn"),
-      previous: document.getElementById("previous"),
+      disconnectBtn: document.getElementById("disconnect-btn"),
+      historyScroll: document.getElementById("history-scroll"),
+      historyLines: document.getElementById("history-lines"),
       current: document.getElementById("current"),
     };
+
+    const MAX_HISTORY_PARAS = 600;
+    const HISTORY_NEAR_BOTTOM_PX = 56;
+
+    function historyPinnedToLatest() {
+      const c = el.historyScroll;
+      if (c.scrollHeight <= c.clientHeight) {
+        return true;
+      }
+      const slack = c.scrollHeight - (c.scrollTop + c.clientHeight);
+      return slack <= HISTORY_NEAR_BOTTOM_PX;
+    }
+
+    function scrollHistoryToLatest() {
+      const c = el.historyScroll;
+      c.scrollTop = c.scrollHeight;
+    }
+
+    function trimHistoryIfNeeded() {
+      while (el.historyLines.children.length > MAX_HISTORY_PARAS) {
+        el.historyLines.removeChild(el.historyLines.firstChild);
+      }
+    }
+
+    function appendHistoryLine(text, note) {
+      const stickIfAdded = historyPinnedToLatest();
+      const p = document.createElement("p");
+      if (note) {
+        p.className = "history-note";
+      }
+      p.textContent = text;
+      el.historyLines.appendChild(p);
+      trimHistoryIfNeeded();
+      if (stickIfAdded) {
+        requestAnimationFrame(() => {
+          scrollHistoryToLatest();
+        });
+      }
+    }
+
+    function resetCaptionUi() {
+      el.historyLines.innerHTML = "";
+      el.current.textContent = "";
+      el.current.classList.remove("partial");
+    }
+
+    function setSubscriberOnline(online) {
+      el.authPanel.classList.toggle("subscriber-online", !!online);
+      el.disconnectBtn.hidden = !online;
+    }
 
     let ably = null;
 
@@ -274,6 +388,7 @@
       const data = captionPayload(msg.data);
       if (data && data.ended === true) {
         setStatus("Session ended by host", "warn");
+        appendHistoryLine("Session ended by host", true);
         el.current.textContent = "";
         el.current.classList.remove("partial");
         return;
@@ -282,10 +397,10 @@
       const text = normalizeWhisperStdoutLine(raw);
       const kind = (data && data.kind) === "final" ? "final" : "partial";
       if (kind === "final") {
-        if (el.current.textContent) {
-          el.previous.textContent = el.current.textContent;
+        if (text) {
+          appendHistoryLine(text, false);
         }
-        el.current.textContent = text;
+        el.current.textContent = "";
         el.current.classList.remove("partial");
       } else {
         el.current.textContent = text;
@@ -297,26 +412,48 @@
       const { error, channel: ch } = resolveChannelOrError();
       if (error) {
         setStatus(error, "error");
+        setSubscriberOnline(false);
         return;
       }
       if (ably) {
         ably.close();
         ably = null;
       }
+      resetCaptionUi();
       el.channelDisplay.textContent = ch;
       sessionStorage.setItem(STORAGE_CHANNEL, ch);
       setStatus("Connecting…", "warn");
       try {
         ably = new Ably.Realtime({ token: token.trim() });
+        setSubscriberOnline(true);
         const chRef = ably.channels.get(ch);
 
-        function startListening() {
+        let captionsSubscribed = false;
+
+        function refreshListeningStatus() {
+          if (!ably || ably.connection.state !== "connected") {
+            return;
+          }
+          setStatus(
+            "Listening · channel " + chRef.state + " · event \"" + CAPTION_EVENT + "\"",
+            ""
+          );
+        }
+
+        function ensureCaptionSubscription() {
+          if (!ably || ably.connection.state !== "connected") {
+            return;
+          }
+          if (captionsSubscribed) {
+            refreshListeningStatus();
+            return;
+          }
+          captionsSubscribed = true;
           chRef
             .subscribe(CAPTION_EVENT, applyCaption)
-            .then(() =>
-              setStatus("Listening · channel " + chRef.state + " · event \"" + CAPTION_EVENT + "\"", "")
-            )
+            .then(() => refreshListeningStatus())
             .catch((err) => {
+              captionsSubscribed = false;
               const msg = err && err.message ? err.message : String(err);
               setStatus("Subscribe / attach failed: " + msg, "error");
               console.error("[captions-relay subscriber]", err);
@@ -324,21 +461,29 @@
         }
 
         chRef.on("failed", () => setStatus("Channel failed", "error"));
+        chRef.on("attached", () => refreshListeningStatus());
 
-        ably.connection.on("disconnected", () => setStatus("Disconnected", "warn"));
+        ably.connection.on("connected", () => {
+          if (!captionsSubscribed) {
+            setStatus("Realtime connected — subscribing…", "warn");
+          }
+          ensureCaptionSubscription();
+        });
+        ably.connection.on("disconnected", () => {
+          if (!ably) {
+            return;
+          }
+          setStatus("Reconnecting…", "warn");
+        });
         ably.connection.on("failed", () => setStatus("Connection failed", "error"));
         ably.connection.on("suspended", () => setStatus("Suspended (retrying…)", "warn"));
 
         if (ably.connection.state === "connected") {
-          setStatus("Realtime connected…", "warn");
-          startListening();
-        } else {
-          ably.connection.once("connected", () => {
-            setStatus("Realtime connected — subscribing…", "warn");
-            startListening();
-          });
+          ensureCaptionSubscription();
         }
       } catch (e) {
+        ably = null;
+        setSubscriberOnline(false);
         setStatus(String(e.message || e), "error");
       }
     }
@@ -353,7 +498,7 @@
       connectWithToken(token);
     });
 
-    el.clearBtn.addEventListener("click", () => {
+    el.disconnectBtn.addEventListener("click", () => {
       sessionStorage.removeItem(STORAGE_TOKEN);
       sessionStorage.removeItem(STORAGE_CHANNEL);
       el.tokenInput.value = "";
@@ -361,12 +506,15 @@
         ably.close();
       }
       ably = null;
-      setStatus("Cleared — paste token to reconnect", "warn");
+      resetCaptionUi();
+      setSubscriberOnline(false);
+      setStatus("Disconnected — paste subscriber token below", "warn");
     });
 
     (function init() {
       const { error, channel: ch } = resolveChannelOrError();
       el.channelDisplay.textContent = ch || "— (add ?channel= to URL)";
+      setSubscriberOnline(false);
       if (error && channelFromQuery.trim()) {
         setStatus(error, "error");
       }

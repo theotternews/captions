@@ -418,8 +418,8 @@ def _run_whisper_pulse(
         click.echo(shell_cmd)
         return
 
-    async def _run() -> None:
-        await run_pulse_caption_pipeline(
+    async def _run() -> int:
+        return await run_pulse_caption_pipeline(
             channel=ch,
             publisher_token=tok,
             shell_command=shell_cmd,
@@ -431,9 +431,11 @@ def _run_whisper_pulse(
         )
 
     try:
-        asyncio.run(_run())
+        exit_code = asyncio.run(_run())
     except KeyboardInterrupt:
         click.echo("", err=True)
+        raise SystemExit(130) from None
+    raise SystemExit(exit_code)
 
 
 @main.group()

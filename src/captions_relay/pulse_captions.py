@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import fcntl
 import logging
 import os
 import pty
 import re
 import shlex
+import signal
 import struct
 import sys
 import termios
@@ -25,6 +27,23 @@ log = logging.getLogger(__name__)
 # Read pty master in chunks. Whisper uses `\r` + CSI when stdout is a TTY; with a bare pipe
 # it falls back to newline logging (duplicated “growing” lines), so we attach a PTY to stdout.
 _PULSE_WHISPER_READ_CHUNK = 16384
+
+
+def _terminate_pulse_pipeline_proc(proc: asyncio.subprocess.Process | None) -> None:
+    """Terminate the whole ``ffmpeg | whisper`` shell pipeline.
+
+    The subprocess is spawned with ``start_new_session=True``, so its PID is the
+    process-group leader; ``killpg`` delivers SIGTERM to the shell and pipe
+    children. ``proc.terminate()`` alone only signals the shell, which often
+    leaves whisper/ffmpeg running after Ctrl-C (Python receives SIGINT, not the
+    detached pipeline).
+    """
+    if proc is None or proc.returncode is not None or proc.pid is None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        proc.terminate()
 
 
 def _pulse_pty_set_winsize(slave_fd: int) -> None:
@@ -270,9 +289,12 @@ async def run_pulse_caption_pipeline(
     transport: asyncio.BaseTransport | None = None
     master_fd: int | None = None
     slave_fd: int | None = None
+    loop: asyncio.AbstractEventLoop | None = None
+    stopped = asyncio.Event()
     try:
         await wait_ably_connected(realtime)
 
+        loop = asyncio.get_running_loop()
         master_fd, slave_fd = pty.openpty()
         _pulse_pty_set_winsize(slave_fd)
         proc = await asyncio.create_subprocess_shell(
@@ -285,43 +307,120 @@ async def run_pulse_caption_pipeline(
         os.close(slave_fd)
         slave_fd = None
 
-        loop = asyncio.get_running_loop()
-        reader = asyncio.StreamReader()
-        pipe_f = os.fdopen(master_fd, "rb", buffering=0, closefd=True)
-        master_fd = None
-        transport, _ = await loop.connect_read_pipe(
-            lambda: asyncio.StreamReaderProtocol(reader),
-            pipe_f,
-        )
+        def _on_shutdown_signal() -> None:
+            _terminate_pulse_pipeline_proc(proc)
+            stopped.set()
 
-        if not verbose_echo_whisper:
-            log.info("Started ffmpeg | whisper pipeline (pid %s, whisper stdout is a PTY)", proc.pid)
+        loop.add_signal_handler(signal.SIGINT, _on_shutdown_signal)
+        loop.add_signal_handler(signal.SIGTERM, _on_shutdown_signal)
+        try:
+            reader = asyncio.StreamReader()
+            pipe_f = os.fdopen(master_fd, "rb", buffering=0, closefd=True)
+            master_fd = None
+            transport, _ = await loop.connect_read_pipe(
+                lambda: asyncio.StreamReaderProtocol(reader),
+                pipe_f,
+            )
 
-        pending = bytearray()
-        while True:
-            chunk = await reader.read(_PULSE_WHISPER_READ_CHUNK)
-            if not chunk:
-                break
-            if verbose_echo_whisper:
-                sys.stderr.buffer.write(chunk)
-                sys.stderr.buffer.flush()
-            pending.extend(chunk)
-            while True:
-                nl = pending.find(b"\n")
-                if nl < 0:
-                    break
-                line_bytes = bytes(pending[:nl])
-                del pending[: nl + 1]
-                text = line_bytes.decode("utf-8", errors="replace")
-                line = text.rstrip("\r\n")
-                if line:
-                    await throttle.push(line, line_kind)
+            if not verbose_echo_whisper:
+                log.info("Started ffmpeg | whisper pipeline (pid %s, whisper stdout is a PTY)", proc.pid)
 
-        if pending:
-            text = bytes(pending).decode("utf-8", errors="replace")
-            line = text.rstrip("\r\n")
-            if line:
-                await throttle.push(line, line_kind)
+            proc_wait = asyncio.create_task(proc.wait())
+            try:
+                pending_lines = bytearray()
+                breaking = False
+                user_stopped = False
+                while not breaking:
+                    read_task = asyncio.create_task(reader.read(_PULSE_WHISPER_READ_CHUNK))
+                    stop_task = asyncio.create_task(stopped.wait())
+                    done_tasks, _ = await asyncio.wait(
+                        {read_task, stop_task, proc_wait},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+
+                    if stop_task in done_tasks:
+                        read_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await read_task
+                        if not proc_wait.done():
+                            proc_wait.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await proc_wait
+                        user_stopped = True
+                        breaking = True
+                        continue
+
+                    if proc_wait in done_tasks:
+                        read_task.cancel()
+                        stop_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await read_task
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await stop_task
+                        breaking = True
+                        continue
+
+                    stop_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await stop_task
+
+                    chunk = read_task.result()
+
+                    if not chunk:
+                        breaking = True
+                        continue
+
+                    if verbose_echo_whisper:
+                        sys.stderr.buffer.write(chunk)
+                        sys.stderr.buffer.flush()
+                    pending_lines.extend(chunk)
+                    while True:
+                        nl = pending_lines.find(b"\n")
+                        if nl < 0:
+                            break
+                        line_bytes = bytes(pending_lines[:nl])
+                        del pending_lines[: nl + 1]
+                        text = line_bytes.decode("utf-8", errors="replace")
+                        line = text.rstrip("\r\n")
+                        if line:
+                            await throttle.push(line, line_kind)
+
+                if not user_stopped:
+                    while True:
+                        chunk = await reader.read(_PULSE_WHISPER_READ_CHUNK)
+                        if not chunk:
+                            break
+                        if verbose_echo_whisper:
+                            sys.stderr.buffer.write(chunk)
+                            sys.stderr.buffer.flush()
+                        pending_lines.extend(chunk)
+                        while True:
+                            nl = pending_lines.find(b"\n")
+                            if nl < 0:
+                                break
+                            line_bytes = bytes(pending_lines[:nl])
+                            del pending_lines[: nl + 1]
+                            text = line_bytes.decode("utf-8", errors="replace")
+                            line = text.rstrip("\r\n")
+                            if line:
+                                await throttle.push(line, line_kind)
+
+                    if pending_lines:
+                        text = bytes(pending_lines).decode("utf-8", errors="replace")
+                        line = text.rstrip("\r\n")
+                        if line:
+                            await throttle.push(line, line_kind)
+            finally:
+                if not proc_wait.done():
+                    proc_wait.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await proc_wait
+        finally:
+            if loop is not None:
+                with contextlib.suppress(ValueError, NotImplementedError):
+                    loop.remove_signal_handler(signal.SIGINT)
+                with contextlib.suppress(ValueError, NotImplementedError):
+                    loop.remove_signal_handler(signal.SIGTERM)
     finally:
         if slave_fd is not None:
             try:
@@ -337,11 +436,15 @@ async def run_pulse_caption_pipeline(
             transport.close()
         await throttle.aclose()
         if proc is not None and proc.returncode is None:
-            proc.terminate()
+            _terminate_pulse_pipeline_proc(proc)
             try:
                 await asyncio.wait_for(proc.wait(), timeout=8.0)
             except TimeoutError:
-                proc.kill()
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    if proc.pid is not None:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
                 await proc.wait()
         await realtime.close()
 
