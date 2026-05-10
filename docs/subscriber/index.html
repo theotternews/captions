@@ -104,15 +104,17 @@
       cursor: not-allowed;
     }
     #caption-pane {
-      flex: 1 1 auto;
+      flex: 1 1 0%;
       display: flex;
       flex-direction: column;
       min-height: 0;
       overflow: hidden;
     }
     #history-scroll {
-      flex: 1 1 auto;
-      min-height: 0;
+      flex: 1 1 0%;
+      min-height: clamp(7rem, 30dvh, 55vh);
+      display: flex;
+      flex-direction: column;
       overflow-y: auto;
       overflow-x: hidden;
       padding: 0.25rem 0.15rem 0.75rem 0;
@@ -123,11 +125,14 @@
       display: flex;
       flex-direction: column;
       gap: 0.55rem;
+      margin-top: auto;
+      width: 100%;
+      flex-shrink: 0;
     }
     #history-lines p {
       margin: 0;
       font-size: clamp(0.95rem, 3.2vw, 1.2rem);
-      color: var(--muted);
+      color: #d4d4d8;
       line-height: 1.4;
       text-wrap: pretty;
       word-break: break-word;
@@ -168,6 +173,17 @@
   </header>
   <main>
     <div id="auth-panel">
+      <div id="channel-row">
+        <label for="channel-input">Channel name</label>
+        <input
+          id="channel-input"
+          type="text"
+          autocomplete="off"
+          autocapitalize="off"
+          spellcheck="false"
+          placeholder="e.g. captions:… or paste facilitator subscriber URL"
+        />
+      </div>
       <label for="token-input">Subscriber token (from facilitator)</label>
       <textarea id="token-input" rows="4" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste token…"></textarea>
       <button type="button" id="connect-btn">Save & connect</button>
@@ -191,6 +207,8 @@
 
     const el = {
       authPanel: document.getElementById("auth-panel"),
+      channelRow: document.getElementById("channel-row"),
+      channelInput: document.getElementById("channel-input"),
       channelDisplay: document.getElementById("channel-display"),
       status: document.getElementById("status"),
       tokenInput: document.getElementById("token-input"),
@@ -315,11 +333,15 @@
       return validateAblyChannelName(s);
     }
 
-    /** Raw channel from ?channel= query (preferred) or last saved sessionStorage. */
+    /** Raw channel from ?channel= (preferred), typed field when no URL param, or sessionStorage. */
     function currentChannelRaw() {
       const q = channelFromQuery.trim();
       if (q) {
         return q;
+      }
+      const typed = el.channelInput.value.trim();
+      if (typed) {
+        return typed;
       }
       return (sessionStorage.getItem(STORAGE_CHANNEL) || "").trim();
     }
@@ -327,13 +349,25 @@
     function resolveChannelOrError() {
       const raw = currentChannelRaw();
       if (!raw) {
-        return { error: "Missing ?channel=… in URL", channel: "" };
+        return {
+          error: channelFromQuery.trim()
+            ? "Invalid channel in URL (?channel=)"
+            : "Enter channel name—or paste subscriber URL—including channel=… fragment",
+          channel: "",
+        };
       }
       try {
         return { error: null, channel: normalizeCaptionChannel(raw) };
       } catch (e) {
         return { error: e.message || String(e), channel: "" };
       }
+    }
+
+    function defaultOfflineStatus() {
+      if (channelFromQuery.trim()) {
+        return "Disconnected — paste subscriber token below";
+      }
+      return "Disconnected — enter channel and subscriber token below";
     }
 
     const ANSI_CSI_RE = /\x1b\[[0-?]*[ -/]*[@-~]/g;
@@ -384,8 +418,14 @@
       return typeof raw === "object" ? raw : {};
     }
 
+    function captionMessageKind(data) {
+      const k = data && data.kind;
+      return String(k ?? "").trim().toLowerCase() === "final" ? "final" : "partial";
+    }
+
     function applyCaption(msg) {
-      const data = captionPayload(msg.data);
+      const rawPayload = msg && Object.prototype.hasOwnProperty.call(msg, "data") ? msg.data : msg;
+      const data = captionPayload(rawPayload);
       if (data && data.ended === true) {
         setStatus("Session ended by host", "warn");
         appendHistoryLine("Session ended by host", true);
@@ -395,10 +435,17 @@
       }
       const raw = (data && data.text) || "";
       const text = normalizeWhisperStdoutLine(raw);
-      const kind = (data && data.kind) === "final" ? "final" : "partial";
+      const kind = captionMessageKind(data);
       if (kind === "final") {
-        if (text) {
-          appendHistoryLine(text, false);
+        let historyLine = text;
+        if (!historyLine) {
+          const fromLive = normalizeWhisperStdoutLine(el.current.textContent);
+          if (fromLive) {
+            historyLine = fromLive;
+          }
+        }
+        if (historyLine) {
+          appendHistoryLine(historyLine, false);
         }
         el.current.textContent = "";
         el.current.classList.remove("partial");
@@ -502,19 +549,30 @@
       sessionStorage.removeItem(STORAGE_TOKEN);
       sessionStorage.removeItem(STORAGE_CHANNEL);
       el.tokenInput.value = "";
+      if (!channelFromQuery.trim()) {
+        el.channelInput.value = "";
+      }
       if (ably) {
         ably.close();
       }
       ably = null;
       resetCaptionUi();
       setSubscriberOnline(false);
-      setStatus("Disconnected — paste subscriber token below", "warn");
+      setStatus(defaultOfflineStatus(), "warn");
     });
 
     (function init() {
+      if (channelFromQuery.trim()) {
+        el.channelRow.hidden = true;
+      } else {
+        el.channelRow.hidden = false;
+        el.channelInput.value = sessionStorage.getItem(STORAGE_CHANNEL) || "";
+      }
+
       const { error, channel: ch } = resolveChannelOrError();
-      el.channelDisplay.textContent = ch || "— (add ?channel= to URL)";
+      el.channelDisplay.textContent = ch || "—";
       setSubscriberOnline(false);
+      setStatus(defaultOfflineStatus(), "warn");
       if (error && channelFromQuery.trim()) {
         setStatus(error, "error");
       }

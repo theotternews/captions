@@ -369,7 +369,7 @@ def _run_whisper_pulse(
     whisper_binary: str | None = None,
     model_path: str | None = None,
     extra_whisper_args: str = "",
-    line_kind: str = "final",
+    line_kind: str = "auto",
     debounce_ms: int = 400,
     min_interval_ms: int = 450,
     dry_run: bool = False,
@@ -510,10 +510,13 @@ def whisper() -> None:
 )
 @click.option(
     "--line-kind",
-    type=click.Choice(["final", "partial"]),
-    default="final",
+    type=click.Choice(["auto", "final", "partial"]),
+    default="auto",
     show_default=True,
-    help="Whether each stdout line is published as a final or partial caption.",
+    help=(
+        "auto: interim \\r rewrites publish as partial, completed \\n lines as final. "
+        "final/partial: only \\n-terminated lines emit, fixed kind (legacy)."
+    ),
 )
 @click.option("--debounce-ms", type=int, default=400, show_default=True)
 @click.option("--min-interval-ms", type=int, default=450, show_default=True)

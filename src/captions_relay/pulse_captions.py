@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import contextlib
 import fcntl
 import logging
@@ -68,8 +69,8 @@ _ANSI_OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 def normalize_whisper_stdout_line(raw: str, *, min_dup_prefix: int = 4) -> str:
     """Turn TTY-oriented whisper stdout into plain caption text.
 
-    Reference implementation mirrored in `web/subscriber` (and `docs/subscriber`).
-    The pulse → Ably path publishes **raw** stdout lines so subscribers can normalize.
+    Subscriber pages mirror this helper. With ``--line-kind auto``, the pulse pipeline
+    also uses it when slicing PTY stdout into incremental ``partial`` / ``final`` publishes.
     """
     s = _ANSI_OSC_RE.sub("", raw)
     s = _ANSI_CSI_RE.sub("", s)
@@ -93,6 +94,120 @@ def _collapse_redundant_prefix_repeat(s: str, *, min_prefix: int) -> str:
             break
         s = s[cut:]
     return s
+
+
+class WhisperStdoutStreamProcessor:
+    """Incremental UTF-8 decode of whisper PTY stdout → caption (text, kind) events.
+
+    * **auto** — ``\\r`` amendments publish as ``partial`` (deduped snapshot); ``\\n`` publishes
+      ``final``. Matches `normalize_whisper_stdout_line` semantics (mirrors subscriber).
+    * **final** / **partial** — only ``\\n``-delimited logical lines are emitted, all with that kind
+      (legacy pulse behavior without interim ``\\r`` traffic).
+    """
+
+    def __init__(self, *, line_kind: str) -> None:
+        if line_kind not in {"auto", "final", "partial"}:
+            raise ValueError(f"line_kind must be auto, final, or partial, not {line_kind!r}")
+        self._line_kind = line_kind
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self._line_tail = ""
+        self._last_partial_norm = ""
+
+    def feed(self, data: bytes) -> list[tuple[str, str]]:
+        self._line_tail += self._decoder.decode(data, final=False)
+        if self._line_kind == "auto":
+            return self._feed_auto()
+        return self._feed_forced()
+
+    def _emit_auto_segment(self, segment: str, events: list[tuple[str, str]]) -> None:
+        idx = 0
+        while True:
+            j = segment.find("\r", idx)
+            if j < 0:
+                break
+            snap = normalize_whisper_stdout_line(segment[: j + 1])
+            if snap and snap != self._last_partial_norm:
+                events.append((snap, "partial"))
+                self._last_partial_norm = snap
+            idx = j + 1
+        snap = normalize_whisper_stdout_line(segment)
+        if "\r" in segment and snap and snap != self._last_partial_norm:
+            events.append((snap, "partial"))
+            self._last_partial_norm = snap
+
+    def _feed_auto(self) -> list[tuple[str, str]]:
+        """Each ``\\n`` in the UTF-8 stream ends a logical line → one ``final`` (plus any ``\\r`` partials inside that line)."""
+        events: list[tuple[str, str]] = []
+        while "\n" in self._line_tail:
+            nl = self._line_tail.index("\n")
+            segment = self._line_tail[:nl]
+            self._line_tail = self._line_tail[nl + 1 :]
+            # CRLF: drop the ``\\r`` that immediately precedes ``\\n`` so ``normalize`` does
+            # not treat it as a TTY rewrite and return "".
+            if segment.endswith("\r"):
+                segment = segment[:-1]
+            self._emit_auto_segment(segment, events)
+            self._last_partial_norm = ""
+            fin = normalize_whisper_stdout_line(segment)
+            if fin:
+                events.append((fin, "final"))
+        snap = normalize_whisper_stdout_line(self._line_tail)
+        if snap and snap != self._last_partial_norm:
+            events.append((snap, "partial"))
+            self._last_partial_norm = snap
+        return events
+
+    def _feed_forced(self) -> list[tuple[str, str]]:
+        events: list[tuple[str, str]] = []
+        kind = self._line_kind
+        while "\n" in self._line_tail:
+            line, _, rest = self._line_tail.partition("\n")
+            self._line_tail = rest
+            if line.endswith("\r"):
+                line = line[:-1]
+            t = normalize_whisper_stdout_line(line)
+            if t:
+                events.append((t, kind))
+        return events
+
+    def close(self) -> list[tuple[str, str]]:
+        self._line_tail += self._decoder.decode(b"", final=True)
+        if self._line_kind == "auto":
+            events: list[tuple[str, str]] = []
+            while "\n" in self._line_tail:
+                nl = self._line_tail.index("\n")
+                segment = self._line_tail[:nl]
+                self._line_tail = self._line_tail[nl + 1 :]
+                if segment.endswith("\r"):
+                    segment = segment[:-1]
+                self._emit_auto_segment(segment, events)
+                self._last_partial_norm = ""
+                fin = normalize_whisper_stdout_line(segment)
+                if fin:
+                    events.append((fin, "final"))
+            snap = normalize_whisper_stdout_line(self._line_tail)
+            if snap:
+                # Incomplete logical line when the subprocess exits — commit once as final so
+                # subscribers can move scrollback past #current-only partials (CaptionThrottle
+                # will skip the redundant partial send if merged with the following final).
+                events.append((snap, "final"))
+            self._line_tail = ""
+            return events
+        events = []
+        kind = self._line_kind
+        while "\n" in self._line_tail:
+            line, _, rest = self._line_tail.partition("\n")
+            self._line_tail = rest
+            if line.endswith("\r"):
+                line = line[:-1]
+            t = normalize_whisper_stdout_line(line)
+            if t:
+                events.append((t, kind))
+        t = normalize_whisper_stdout_line(self._line_tail)
+        if t:
+            events.append((t, kind))
+        self._line_tail = ""
+        return events
 
 
 class CaptionThrottle:
@@ -245,6 +360,11 @@ def build_pulse_pipeline_command(
     return f"{shlex.join(ffmpeg_argv)} | {shlex.join(whisper_argv)}"
 
 
+async def _pulse_push_caption_events(throttle: CaptionThrottle, events: list[tuple[str, str]]) -> None:
+    for text, kind in events:
+        await throttle.push(text, kind)
+
+
 async def wait_ably_connected(realtime: AblyRealtime, *, timeout_s: float = 30.0) -> None:
     deadline = asyncio.get_running_loop().time() + timeout_s
     while asyncio.get_running_loop().time() < deadline:
@@ -326,8 +446,8 @@ async def run_pulse_caption_pipeline(
                 log.info("Started ffmpeg | whisper pipeline (pid %s, whisper stdout is a PTY)", proc.pid)
 
             proc_wait = asyncio.create_task(proc.wait())
+            whisper_out = WhisperStdoutStreamProcessor(line_kind=line_kind)
             try:
-                pending_lines = bytearray()
                 breaking = False
                 user_stopped = False
                 while not breaking:
@@ -373,17 +493,7 @@ async def run_pulse_caption_pipeline(
                     if verbose_echo_whisper:
                         sys.stderr.buffer.write(chunk)
                         sys.stderr.buffer.flush()
-                    pending_lines.extend(chunk)
-                    while True:
-                        nl = pending_lines.find(b"\n")
-                        if nl < 0:
-                            break
-                        line_bytes = bytes(pending_lines[:nl])
-                        del pending_lines[: nl + 1]
-                        text = line_bytes.decode("utf-8", errors="replace")
-                        line = text.rstrip("\r\n")
-                        if line:
-                            await throttle.push(line, line_kind)
+                    await _pulse_push_caption_events(throttle, whisper_out.feed(chunk))
 
                 if not user_stopped:
                     while True:
@@ -393,23 +503,11 @@ async def run_pulse_caption_pipeline(
                         if verbose_echo_whisper:
                             sys.stderr.buffer.write(chunk)
                             sys.stderr.buffer.flush()
-                        pending_lines.extend(chunk)
-                        while True:
-                            nl = pending_lines.find(b"\n")
-                            if nl < 0:
-                                break
-                            line_bytes = bytes(pending_lines[:nl])
-                            del pending_lines[: nl + 1]
-                            text = line_bytes.decode("utf-8", errors="replace")
-                            line = text.rstrip("\r\n")
-                            if line:
-                                await throttle.push(line, line_kind)
+                        await _pulse_push_caption_events(throttle, whisper_out.feed(chunk))
 
-                    if pending_lines:
-                        text = bytes(pending_lines).decode("utf-8", errors="replace")
-                        line = text.rstrip("\r\n")
-                        if line:
-                            await throttle.push(line, line_kind)
+                # Always flush processor state (EOF final for auto tail; forced modes). Omitting
+                # this on Ctrl+C/user stop left scrollback subscriber history empty (#current only).
+                await _pulse_push_caption_events(throttle, whisper_out.close())
             finally:
                 if not proc_wait.done():
                     proc_wait.cancel()

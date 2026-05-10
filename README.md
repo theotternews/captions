@@ -145,9 +145,11 @@ export WHISPER_CPP_HOME=/path/to/whisper.cpp   # defaults: build/bin/whisper-str
 uv run captions whisper pulse --channel '<channel from session new>' -v
 ```
 
-Use **`--dry-run`** to print the resolved `ffmpeg | whisper-stream-pcm` shell command without Ably or audio. Paths can be overridden with `--whisper-binary`, `-m` / `--model`, or env **`CAPTIONS_WHISPER_STREAM_PCM`** / **`CAPTIONS_WHISPER_MODEL`**. The pulse pipeline attaches whisper’s **stdout to a pseudo-TTY** (winsize matched to your **stderr** when it’s a terminal), so whisper uses the same **`\r` / ANSI rewrites** as when you run it interactively; a plain pipe would make it fall back to newline logging and look “duplicated”. **`--verbose`** (`-v`) copies that **raw PTY output** to **`stderr`** in **chunks** via `stderr.buffer` (no log prefixes). Captions on Ably still use UTF-8–decoded lines split on `\n` (plus any trailing bytes at EOF). Ably client log noise stays suppressed during `whisper pulse`.
+Use **`--dry-run`** to print the resolved `ffmpeg | whisper-stream-pcm` shell command without running Ably or audio. Paths can be overridden with `--whisper-binary`, `-m` / `--model`, or env **`CAPTIONS_WHISPER_STREAM_PCM`** / **`CAPTIONS_WHISPER_MODEL`**. The pulse pipeline attaches whisper’s **stdout to a pseudo-TTY** (winsize matched to your **stderr** when it’s a terminal), so whisper uses the same **`\r` / ANSI rewrites** as when you run it interactively; a plain pipe would make it fall back to newline logging and look “duplicated”. **`--verbose`** (`-v`) copies that **raw PTY output** to **`stderr`** in **chunks** via `stderr.buffer` (no log prefixes). Ably client log noise stays suppressed during **`whisper pulse`**.
 
-**Pulse publishes raw stdout lines** (TTY escapes preserved). Normalization happens in the subscriber page so on-screen edits match what a terminal would show.
+**`--line-kind`** defaults to **`auto`**: the relay (`WhisperStdoutStreamProcessor`) decodes UTF-8 incrementally, emits **`partial`** when the on-screen transcript changes (`\r` rewrites plus growing tail lines), and **`final`** when a `\n`-terminated line completes. Use **`partial`** or **`final`** for legacy behavior: one emission per `\n`-only record, forced kind throughout. Subscriber pages still **`normalize_whisper_stdout_line`** on each caption payload text so display matches whisper’s terminal rules.
+
+Captions payloads use **`kind: partial | final`**; partials honor **`--debounce-ms`** and **`--min-interval-ms`** while finals bypass debounce, so `\r`-heavy transcripts may need tuning.
 
 ## Two-phone rehearsal checklist
 
