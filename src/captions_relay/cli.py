@@ -98,12 +98,44 @@ def session() -> None:
     is_flag=True,
     help="With --pulse: echo raw whisper stdout to stderr (see whisper pulse -v).",
 )
+@click.option(
+    "--whisper-cpp-home",
+    type=str,
+    default=None,
+    envvar=ENV_WHISPER_CPP_HOME,
+    help=(
+        "With --pulse: whisper.cpp root (same as whisper pulse; "
+        f"env {ENV_WHISPER_CPP_HOME})."
+    ),
+)
+@click.option(
+    "--whisper-binary",
+    type=str,
+    default=None,
+    envvar=ENV_WHISPER_BINARY,
+    help=f"With --pulse: whisper-stream-pcm path (env {ENV_WHISPER_BINARY}).",
+)
+@click.option(
+    "--model",
+    "-m",
+    "model_path",
+    type=str,
+    default=None,
+    envvar=ENV_WHISPER_MODEL,
+    help=(
+        "With --pulse: ggml model path or filename under models/ "
+        f"(same as whisper pulse; env {ENV_WHISPER_MODEL})."
+    ),
+)
 def session_new(
     ttl: int | None,
     as_json: bool,
     channel: str | None,
     start_pulse: bool,
     verbose: bool,
+    whisper_cpp_home: str | None,
+    whisper_binary: str | None,
+    model_path: str | None,
 ) -> None:
     """Generate a channel name and short-lived publisher/subscriber tokens."""
     if start_pulse and as_json:
@@ -158,9 +190,9 @@ def session_new(
         _run_whisper_pulse(
             channel,
             pub.token,
-            whisper_cpp_home=os.environ.get(ENV_WHISPER_CPP_HOME),
-            whisper_binary=os.environ.get(ENV_WHISPER_BINARY),
-            model_path=os.environ.get(ENV_WHISPER_MODEL),
+            whisper_cpp_home=whisper_cpp_home,
+            whisper_binary=whisper_binary,
+            model_path=model_path,
             verbose=verbose,
         )
 
@@ -319,13 +351,21 @@ def _resolve_whisper_paths_from_home(
     whisper_binary: str | None,
     model_path: str | None,
 ) -> tuple[str, str]:
-    """Apply WHISPER_CPP_HOME defaults: build/bin/whisper-stream-pcm and models/."""
+    """Resolve binary and model paths under a whisper.cpp root.
+
+    If ``whisper_cpp_home`` is unset or blank, ``./whisper.cpp`` under the current
+    working directory is used unless both ``whisper_binary`` and ``model_path`` are
+    set (then home is unused).
+    Defaults: ``build/bin/whisper-stream-pcm`` and ``models/{WHISPER_CPP_DEFAULT_MODEL}``.
+    """
     home = (whisper_cpp_home or "").strip()
     wb = (whisper_binary or "").strip()
     mp = (model_path or "").strip()
 
     if not home:
-        return wb, mp
+        if wb and mp:
+            return wb, mp
+        home = str((Path.cwd() / "whisper.cpp").resolve())
 
     root = Path(home).expanduser().resolve()
     bin_default = str(root.joinpath(*WHISPER_CPP_REL_BINARY))
@@ -382,14 +422,14 @@ def _run_whisper_pulse(
 
     if not wb:
         raise click.UsageError(
-            f"Set --whisper-cpp-home / {ENV_WHISPER_CPP_HOME}, "
-            f"or pass --whisper-binary, or set {ENV_WHISPER_BINARY}."
+            f"Pass --whisper-binary or set {ENV_WHISPER_BINARY} "
+            f"(defaults use ./whisper.cpp under $PWD or set {ENV_WHISPER_CPP_HOME})."
         )
 
     if not mp:
         raise click.UsageError(
-            f"Set --whisper-cpp-home / {ENV_WHISPER_CPP_HOME}, "
-            f"or pass --model / -m, or set {ENV_WHISPER_MODEL}."
+            f"Pass --model / -m or set {ENV_WHISPER_MODEL} "
+            f"(defaults use ./whisper.cpp under $PWD or set {ENV_WHISPER_CPP_HOME})."
         )
 
     tok = (publisher_token or "").strip()
@@ -475,8 +515,9 @@ def whisper() -> None:
     default=None,
     envvar=ENV_WHISPER_CPP_HOME,
     help=(
-        "whisper.cpp checkout; defaults binary to build/bin/whisper-stream-pcm "
-        f"and model to models/{WHISPER_CPP_DEFAULT_MODEL} under this path "
+        "whisper.cpp checkout root; defaults to $PWD/whisper.cpp when unset. "
+        "Fills in binary build/bin/whisper-stream-pcm and model "
+        f"models/{WHISPER_CPP_DEFAULT_MODEL} under that root "
         f"(env {ENV_WHISPER_CPP_HOME})."
     ),
 )
@@ -498,7 +539,8 @@ def whisper() -> None:
     default=None,
     envvar=ENV_WHISPER_MODEL,
     help=(
-        "ggml model path or filename under models/ when --whisper-cpp-home is set "
+        "ggml model path or filename under models/ when using "
+        "--whisper-cpp-home or $PWD/whisper.cpp defaults "
         f"(or env {ENV_WHISPER_MODEL})."
     ),
 )
