@@ -34,6 +34,7 @@ from captions_relay.config import (
     normalize_caption_channel,
     subscriber_index_url,
 )
+from captions_relay import session_cache
 from captions_relay.pulse_captions import (
     build_jitsi_pipeline_command,
     build_pulse_pipeline_command,
@@ -181,6 +182,15 @@ def session() -> None:
         f"(env {ENV_JITSI_PULLER_SCRIPT}, default: <project-root>/jitsi-audio-puller/index.js)."
     ),
 )
+@click.option(
+    "--reconnect",
+    "reconnect",
+    is_flag=True,
+    help=(
+        "Reuse cached tokens for the session derived from --jitsi instead of minting new ones. "
+        "Errors out if no valid cached session exists. Cannot be combined with --channel or --json."
+    ),
+)
 def session_new(
     ttl: int | None,
     as_json: bool,
@@ -193,6 +203,7 @@ def session_new(
     jitsi_url: str | None,
     node_bin: str | None,
     jitsi_puller_script: str | None,
+    reconnect: bool,
 ) -> None:
     """Generate a channel name and short-lived publisher/subscriber tokens."""
     if start_pulse and as_json:
@@ -201,56 +212,76 @@ def session_new(
         raise click.UsageError("Cannot combine --jitsi with --json.")
     if jitsi_url and start_pulse:
         raise click.UsageError("Cannot combine --jitsi with --pulse.")
+    if reconnect and as_json:
+        raise click.UsageError("Cannot combine --reconnect with --json.")
+    if reconnect and channel:
+        raise click.UsageError("Cannot combine --reconnect with --channel.")
+    if reconnect and not jitsi_url:
+        raise click.UsageError("--reconnect requires --jitsi.")
 
     ttl_eff = ttl if ttl is not None else _default_ttl()
     channel = _channel_for_session_new(channel, jitsi_url=jitsi_url)
-    try:
-        pub = mint_publisher_token(channel, ttl_eff)
-        sub = mint_subscriber_token(channel, ttl_eff)
-    except AblyException as e:
-        raise click.ClickException(f"Ably error: {e}") from e
-    except ValueError as e:
-        raise click.ClickException(str(e)) from e
 
-    if as_json:
-        sub_url = subscriber_index_url(channel)
-        payload = {
-            "channel": channel,
-            "caption_event": CAPTION_EVENT,
-            "ttl_seconds": ttl_eff,
-            "subscriber_url": sub_url,
-            "publisher_token": pub.token,
-            "subscriber_token": sub.token,
-        }
-        click.echo(json.dumps(payload, indent=2))
-        return
+    if reconnect:
+        cached = session_cache.load_session(channel)
+        if cached is None or not session_cache.is_valid(cached):
+            raise click.ClickException(
+                f"No valid cached session for channel {channel!r}. "
+                "Run without --reconnect to mint fresh tokens and cache them."
+            )
+        pub_token = cached["publisher_token"]
+        click.echo(click.style(f"Reconnecting to existing session on channel {channel!r}.", bold=True))
+    else:
+        try:
+            pub = mint_publisher_token(channel, ttl_eff)
+            sub = mint_subscriber_token(channel, ttl_eff)
+        except AblyException as e:
+            raise click.ClickException(f"Ably error: {e}") from e
+        except ValueError as e:
+            raise click.ClickException(str(e)) from e
 
-    click.echo(f"channel:     {channel}")
-    click.echo(f"event:       {CAPTION_EVENT}")
-    click.echo(f"ttl:         {ttl_eff}s (~{ttl_eff // 3600}h)" if ttl_eff >= 3600 else f"ttl:         {ttl_eff}s")
-    click.echo("")
-    click.echo(
-        click.style(
-            "Keep publisher_token PRIVATE. Paste subscriber_token into the subscriber page.",
-            fg="yellow",
+        session_cache.save_session(channel, pub, sub)
+        pub_token = pub.token
+
+        if as_json:
+            sub_url = subscriber_index_url(channel)
+            payload = {
+                "channel": channel,
+                "caption_event": CAPTION_EVENT,
+                "ttl_seconds": ttl_eff,
+                "subscriber_url": sub_url,
+                "publisher_token": pub.token,
+                "subscriber_token": sub.token,
+            }
+            click.echo(json.dumps(payload, indent=2))
+            return
+
+        click.echo(f"channel:     {channel}")
+        click.echo(f"event:       {CAPTION_EVENT}")
+        click.echo(f"ttl:         {ttl_eff}s (~{ttl_eff // 3600}h)" if ttl_eff >= 3600 else f"ttl:         {ttl_eff}s")
+        click.echo("")
+        click.echo(
+            click.style(
+                "Keep publisher_token PRIVATE. Paste subscriber_token into the subscriber page.",
+                fg="yellow",
+            )
         )
-    )
-    click.echo("")
-    click.echo(click.style("publisher_token:", bold=True))
-    click.echo(pub.token)
-    click.echo("")
-    click.echo(click.style("subscriber_token:", bold=True))
-    click.echo(sub.token)
-    click.echo("")
-    click.echo("Subscriber URL:")
-    click.echo(f"  {subscriber_index_url(channel)}")
+        click.echo("")
+        click.echo(click.style("publisher_token:", bold=True))
+        click.echo(pub.token)
+        click.echo("")
+        click.echo(click.style("subscriber_token:", bold=True))
+        click.echo(sub.token)
+        click.echo("")
+        click.echo("Subscriber URL:")
+        click.echo(f"  {subscriber_index_url(channel)}")
 
     if start_pulse:
         click.echo("")
         click.echo(click.style("Starting whisper pulse…", bold=True))
         _run_whisper_pulse(
             channel,
-            pub.token,
+            pub_token,
             whisper_cpp_home=whisper_cpp_home,
             whisper_binary=whisper_binary,
             model_path=model_path,
@@ -259,10 +290,10 @@ def session_new(
 
     if jitsi_url:
         click.echo("")
-        click.echo(click.style(f"Joining Jitsi meeting and starting captions…", bold=True))
+        click.echo(click.style("Joining Jitsi meeting and starting captions…", bold=True))
         _run_whisper_jitsi(
             channel,
-            pub.token,
+            pub_token,
             jitsi_url=jitsi_url,
             node_bin=node_bin or "node",
             puller_script=jitsi_puller_script or default_jitsi_puller_script(),
@@ -899,6 +930,15 @@ def whisper_pulse(
     is_flag=True,
     help="Echo whisper's raw stdout bytes to stderr.",
 )
+@click.option(
+    "--reconnect",
+    "reconnect",
+    is_flag=True,
+    help=(
+        "Reuse the cached publisher token for --channel instead of requiring --publisher-token. "
+        "Errors out if no valid cached session exists for the channel."
+    ),
+)
 def whisper_jitsi(
     channel: str,
     publisher_token: str | None,
@@ -920,11 +960,23 @@ def whisper_jitsi(
     min_interval_ms: int,
     dry_run: bool,
     verbose: bool,
+    reconnect: bool,
 ) -> None:
     """Jitsi meeting → ffmpeg (WAV) → whisper-stream-pcm; publish stdout lines to Ably."""
+    if reconnect:
+        cached = session_cache.load_session(channel)
+        if cached is None or not session_cache.is_valid(cached):
+            raise click.ClickException(
+                f"No valid cached session for channel {channel!r}. "
+                "Run 'session new --jitsi ...' without --reconnect to mint and cache fresh tokens."
+            )
+        tok = cached["publisher_token"]
+    else:
+        tok = publisher_token or ""
+
     _run_whisper_jitsi(
         channel,
-        publisher_token or "",
+        tok,
         jitsi_url=jitsi_url,
         node_bin=node_bin,
         puller_script=jitsi_puller_script or default_jitsi_puller_script(),
