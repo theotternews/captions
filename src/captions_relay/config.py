@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 ENV_API_KEY = "CAPTIONS_ABLY_API_KEY"
@@ -13,12 +14,24 @@ ENV_WHISPER_BINARY = "CAPTIONS_WHISPER_STREAM_PCM"
 ENV_WHISPER_MODEL = "CAPTIONS_WHISPER_MODEL"
 ENV_WHISPER_CPP_HOME = "WHISPER_CPP_HOME"
 ENV_SUBSCRIBER_PAGES_BASE = "CAPTIONS_SUBSCRIBER_PAGES_BASE"
+ENV_NODE_BIN = "CAPTIONS_NODE_BIN"
+ENV_JITSI_PULLER_SCRIPT = "CAPTIONS_JITSI_PULLER_SCRIPT"
+
+# jitsi-audio-puller lives at <project-root>/jitsi-audio-puller/index.js;
+# __file__ is src/captions_relay/config.py so .parent*3 is the project root.
+_PROJECT_ROOT = Path(__file__).parent.parent.parent
+_DEFAULT_JITSI_PULLER_SCRIPT = str(_PROJECT_ROOT / "jitsi-audio-puller" / "index.js")
+
+
+def default_jitsi_puller_script() -> str:
+    """Return the path to jitsi-audio-puller index.js, overridable via env."""
+    return os.environ.get(ENV_JITSI_PULLER_SCRIPT, "").strip() or _DEFAULT_JITSI_PULLER_SCRIPT
 
 CAPTION_EVENT = "caption"
 
 WHISPER_CPP_REL_BINARY = ("build", "bin", "whisper-stream-pcm")
 WHISPER_CPP_REL_MODELS_DIR = "models"
-WHISPER_CPP_DEFAULT_MODEL = "ggml-base.en-q5_1.bin"
+WHISPER_CPP_DEFAULT_MODEL = "ggml-large-v3-turbo-q8_0.bin"
 
 # Ably: non-empty, no newlines, must not start with '[' or ':', namespace (before
 # first ':') must not contain '*'; practical URL length.

@@ -312,6 +312,59 @@ class CaptionThrottle:
             await send()
 
 
+def build_jitsi_pipeline_command(
+    *,
+    ffmpeg_bin: str,
+    pipe_path: str,
+    sample_rate: int,
+    whisper_bin: str,
+    model_path: str,
+    pcm_format: str,
+    step_ms: int,
+    length_ms: int,
+    keep_ms: int,
+    extra_whisper_args: list[str],
+) -> str:
+    """Build the ``ffmpeg | whisper-stream-pcm`` shell command for a Jitsi FIFO source.
+
+    Reads raw PCM s16le at 48 kHz from ``pipe_path`` and resamples to ``sample_rate``
+    (typically 16 kHz) before piping into whisper-stream-pcm.
+    """
+    ffmpeg_argv = [
+        ffmpeg_bin,
+        "-loglevel",
+        "quiet",
+        "-f",
+        "s16le",
+        "-i",
+        pipe_path,
+        "-ar",
+        str(sample_rate),
+        "-ac",
+        "1",
+        "-f",
+        "wav",
+        "-",
+    ]
+    whisper_argv = [
+        whisper_bin,
+        "-m",
+        model_path,
+        "--format",
+        pcm_format,
+        "--sample-rate",
+        str(sample_rate),
+        "--step",
+        str(step_ms),
+        "--length",
+        str(length_ms),
+        "--keep",
+        str(keep_ms),
+        *extra_whisper_args,
+    ]
+    return f"{shlex.join(ffmpeg_argv)} | {shlex.join(whisper_argv)}"
+
+
 def build_pulse_pipeline_command(
     *,
     ffmpeg_bin: str,
@@ -550,5 +603,64 @@ async def run_pulse_caption_pipeline(
         exit_code = proc.returncode if proc.returncode is not None else 0
         if exit_code != 0 and not verbose_echo_whisper:
             log.info("ffmpeg | whisper exited with code %s", exit_code)
+
+    return exit_code
+
+
+async def run_jitsi_caption_pipeline(
+    *,
+    channel: str,
+    publisher_token: str,
+    jitsi_url: str,
+    node_bin: str,
+    puller_script: str,
+    shell_command: str,
+    fifo_path: str,
+    line_kind: str,
+    debounce_ms: int,
+    min_interval_ms: int,
+    quiet_ably_logs: bool,
+    verbose_echo_whisper: bool = False,
+) -> int:
+    """Start ``node jitsi-audio-puller`` then run ``run_pulse_caption_pipeline``.
+
+    The caller is responsible for pre-creating ``fifo_path`` with ``os.mkfifo``
+    before calling this coroutine.  This function terminates the node process and
+    removes the FIFO in its ``finally`` block regardless of how the pipeline exits.
+    """
+    node_proc: asyncio.subprocess.Process | None = None
+    try:
+        node_proc = await asyncio.create_subprocess_exec(
+            node_bin,
+            puller_script,
+            jitsi_url,
+            fifo_path,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=None,
+        )
+        log.info("Started jitsi-audio-puller (pid %s) for %s", node_proc.pid, jitsi_url)
+
+        exit_code = await run_pulse_caption_pipeline(
+            channel=channel,
+            publisher_token=publisher_token,
+            shell_command=shell_command,
+            line_kind=line_kind,
+            debounce_ms=debounce_ms,
+            min_interval_ms=min_interval_ms,
+            quiet_ably_logs=quiet_ably_logs,
+            verbose_echo_whisper=verbose_echo_whisper,
+        )
+    finally:
+        if node_proc is not None and node_proc.returncode is None:
+            node_proc.terminate()
+            try:
+                await asyncio.wait_for(node_proc.wait(), timeout=5.0)
+            except TimeoutError:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    node_proc.kill()
+                await node_proc.wait()
+        with contextlib.suppress(FileNotFoundError, OSError):
+            os.unlink(fifo_path)
 
     return exit_code

@@ -7,6 +7,7 @@ import shlex
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 import click
 from ably.sync.util.exceptions import AblyException
@@ -19,6 +20,8 @@ from captions_relay.ably_tokens import (
 )
 from captions_relay.config import (
     CAPTION_EVENT,
+    ENV_NODE_BIN,
+    ENV_JITSI_PULLER_SCRIPT,
     ENV_PUBLISHER_TOKEN,
     ENV_TOKEN_TTL,
     ENV_WHISPER_BINARY,
@@ -27,10 +30,16 @@ from captions_relay.config import (
     WHISPER_CPP_DEFAULT_MODEL,
     WHISPER_CPP_REL_BINARY,
     WHISPER_CPP_REL_MODELS_DIR,
+    default_jitsi_puller_script,
     normalize_caption_channel,
     subscriber_index_url,
 )
-from captions_relay.pulse_captions import build_pulse_pipeline_command, run_pulse_caption_pipeline
+from captions_relay.pulse_captions import (
+    build_jitsi_pipeline_command,
+    build_pulse_pipeline_command,
+    run_jitsi_caption_pipeline,
+    run_pulse_caption_pipeline,
+)
 
 PACKAGE_VERSION = "0.1.0"
 
@@ -39,9 +48,26 @@ def _default_ttl() -> int:
     return int(os.environ.get(ENV_TOKEN_TTL, "14400"))
 
 
-def _channel_for_session_new(channel: str | None) -> str:
-    """Default ``captions:<uuidhex>`` or a caller-provided Ably channel name."""
+def _room_name_from_jitsi_url(url: str) -> str | None:
+    """Extract the lowercased room name from a Jitsi meeting URL, or return ``None``."""
+    try:
+        path = urlparse(url).path
+        room = path.strip("/").lower()
+        return room or None
+    except Exception:
+        return None
+
+
+def _channel_for_session_new(channel: str | None, *, jitsi_url: str | None = None) -> str:
+    """Default channel name: Jitsi room → ``captions:<room>``, else ``captions:<uuidhex>``.
+
+    An explicit ``--channel`` always takes precedence.
+    """
     raw = (channel or "").strip()
+    if not raw and jitsi_url:
+        room = _room_name_from_jitsi_url(jitsi_url)
+        if room:
+            raw = f"captions:{room}"
     if not raw:
         return f"captions:{uuid.uuid4().hex}"
     try:
@@ -123,8 +149,36 @@ def session() -> None:
     default=None,
     envvar=ENV_WHISPER_MODEL,
     help=(
-        "With --pulse: ggml model path or filename under models/ "
+        "With --pulse/--jitsi: ggml model path or filename under models/ "
         f"(same as whisper pulse; env {ENV_WHISPER_MODEL})."
+    ),
+)
+@click.option(
+    "--jitsi",
+    "jitsi_url",
+    type=str,
+    default=None,
+    help=(
+        "Jitsi meeting URL (e.g. https://meet.jit.si/MyRoom). "
+        "Joins the meeting as a headless audio bot and streams audio through ffmpeg "
+        "into whisper-stream-pcm. Cannot be combined with --pulse or --json."
+    ),
+)
+@click.option(
+    "--node-bin",
+    type=str,
+    default=None,
+    envvar=ENV_NODE_BIN,
+    help=f"With --jitsi: node executable (env {ENV_NODE_BIN}, default: node).",
+)
+@click.option(
+    "--jitsi-puller-script",
+    type=str,
+    default=None,
+    envvar=ENV_JITSI_PULLER_SCRIPT,
+    help=(
+        f"With --jitsi: path to jitsi-audio-puller index.js "
+        f"(env {ENV_JITSI_PULLER_SCRIPT}, default: <project-root>/jitsi-audio-puller/index.js)."
     ),
 )
 def session_new(
@@ -136,13 +190,20 @@ def session_new(
     whisper_cpp_home: str | None,
     whisper_binary: str | None,
     model_path: str | None,
+    jitsi_url: str | None,
+    node_bin: str | None,
+    jitsi_puller_script: str | None,
 ) -> None:
     """Generate a channel name and short-lived publisher/subscriber tokens."""
     if start_pulse and as_json:
         raise click.UsageError("Cannot combine --pulse with --json.")
+    if jitsi_url and as_json:
+        raise click.UsageError("Cannot combine --jitsi with --json.")
+    if jitsi_url and start_pulse:
+        raise click.UsageError("Cannot combine --jitsi with --pulse.")
 
     ttl_eff = ttl if ttl is not None else _default_ttl()
-    channel = _channel_for_session_new(channel)
+    channel = _channel_for_session_new(channel, jitsi_url=jitsi_url)
     try:
         pub = mint_publisher_token(channel, ttl_eff)
         sub = mint_subscriber_token(channel, ttl_eff)
@@ -190,6 +251,21 @@ def session_new(
         _run_whisper_pulse(
             channel,
             pub.token,
+            whisper_cpp_home=whisper_cpp_home,
+            whisper_binary=whisper_binary,
+            model_path=model_path,
+            verbose=verbose,
+        )
+
+    if jitsi_url:
+        click.echo("")
+        click.echo(click.style(f"Joining Jitsi meeting and starting captions…", bold=True))
+        _run_whisper_jitsi(
+            channel,
+            pub.token,
+            jitsi_url=jitsi_url,
+            node_bin=node_bin or "node",
+            puller_script=jitsi_puller_script or default_jitsi_puller_script(),
             whisper_cpp_home=whisper_cpp_home,
             whisper_binary=whisper_binary,
             model_path=model_path,
@@ -478,6 +554,105 @@ def _run_whisper_pulse(
     raise SystemExit(exit_code)
 
 
+def _run_whisper_jitsi(
+    channel: str,
+    publisher_token: str,
+    *,
+    jitsi_url: str,
+    node_bin: str = "node",
+    puller_script: str | None = None,
+    ffmpeg_bin: str = "ffmpeg",
+    sample_rate: int = 16000,
+    pcm_format: str = "s16",
+    step_ms: int = 1000,
+    length_ms: int = 10000,
+    keep_ms: int = 500,
+    whisper_cpp_home: str | None = None,
+    whisper_binary: str | None = None,
+    model_path: str | None = None,
+    extra_whisper_args: str = "",
+    line_kind: str = "auto",
+    debounce_ms: int = 400,
+    min_interval_ms: int = 450,
+    dry_run: bool = False,
+    verbose: bool = False,
+) -> None:
+    """Shared implementation for ``whisper jitsi`` and ``session new --jitsi``."""
+    import tempfile
+
+    ch = _normalize_cli_channel(channel, param_hint="channel")
+    wb, mp = _resolve_whisper_paths_from_home(whisper_cpp_home, whisper_binary, model_path)
+
+    if not wb:
+        raise click.UsageError(
+            f"Pass --whisper-binary or set {ENV_WHISPER_BINARY} "
+            f"(defaults use ./whisper.cpp under $PWD or set {ENV_WHISPER_CPP_HOME})."
+        )
+
+    if not mp:
+        raise click.UsageError(
+            f"Pass --model / -m or set {ENV_WHISPER_MODEL} "
+            f"(defaults use ./whisper.cpp under $PWD or set {ENV_WHISPER_CPP_HOME})."
+        )
+
+    tok = (publisher_token or "").strip()
+    if not tok and not dry_run:
+        raise click.UsageError(f"Pass --publisher-token or set {ENV_PUBLISHER_TOKEN}.")
+
+    script = puller_script or default_jitsi_puller_script()
+
+    try:
+        extras = shlex.split(extra_whisper_args) if extra_whisper_args.strip() else []
+    except ValueError as e:
+        raise click.BadParameter(str(e), param_hint="extra-whisper-args") from e
+
+    fifo_path = tempfile.mktemp(suffix=".pcm", prefix="jitsi-audio-")  # noqa: S306
+
+    shell_cmd = build_jitsi_pipeline_command(
+        ffmpeg_bin=ffmpeg_bin,
+        pipe_path=fifo_path,
+        sample_rate=sample_rate,
+        whisper_bin=wb,
+        model_path=mp,
+        pcm_format=pcm_format,
+        step_ms=step_ms,
+        length_ms=length_ms,
+        keep_ms=keep_ms,
+        extra_whisper_args=extras,
+    )
+
+    if dry_run:
+        click.echo(f"node {shlex.quote(script)} {shlex.quote(jitsi_url)} {shlex.quote(fifo_path)}")
+        click.echo(shell_cmd)
+        return
+
+    import os as _os
+    _os.mkfifo(fifo_path)
+
+    async def _run() -> int:
+        return await run_jitsi_caption_pipeline(
+            channel=ch,
+            publisher_token=tok,
+            jitsi_url=jitsi_url,
+            node_bin=node_bin,
+            puller_script=script,
+            shell_command=shell_cmd,
+            fifo_path=fifo_path,
+            line_kind=line_kind,
+            debounce_ms=debounce_ms,
+            min_interval_ms=min_interval_ms,
+            quiet_ably_logs=True,
+            verbose_echo_whisper=verbose,
+        )
+
+    try:
+        exit_code = asyncio.run(_run())
+    except KeyboardInterrupt:
+        click.echo("", err=True)
+        raise SystemExit(130) from None
+    raise SystemExit(exit_code)
+
+
 @main.group()
 def whisper() -> None:
     """Stream local whisper transcript lines to Ably (publisher)."""
@@ -599,6 +774,161 @@ def whisper_pulse(
         publisher_token or "",
         ffmpeg_bin=ffmpeg_bin,
         pulse_device=pulse_device,
+        sample_rate=sample_rate,
+        pcm_format=pcm_format,
+        step_ms=step_ms,
+        length_ms=length_ms,
+        keep_ms=keep_ms,
+        whisper_cpp_home=whisper_cpp_home,
+        whisper_binary=whisper_binary,
+        model_path=model_path,
+        extra_whisper_args=extra_whisper_args,
+        line_kind=line_kind,
+        debounce_ms=debounce_ms,
+        min_interval_ms=min_interval_ms,
+        dry_run=dry_run,
+        verbose=verbose,
+    )
+
+
+@whisper.command("jitsi")
+@click.option(
+    "--channel",
+    type=str,
+    required=True,
+    help="Ably channel name.",
+)
+@click.option(
+    "--publisher-token",
+    type=str,
+    default=None,
+    envvar=ENV_PUBLISHER_TOKEN,
+    help=f"Publisher token (or env {ENV_PUBLISHER_TOKEN}).",
+)
+@click.option(
+    "--jitsi-url",
+    type=str,
+    required=True,
+    help="Jitsi meeting URL (e.g. https://meet.jit.si/MyRoom).",
+)
+@click.option(
+    "--node-bin",
+    type=str,
+    default="node",
+    show_default=True,
+    envvar=ENV_NODE_BIN,
+    help=f"node executable (env {ENV_NODE_BIN}).",
+)
+@click.option(
+    "--jitsi-puller-script",
+    type=str,
+    default=None,
+    envvar=ENV_JITSI_PULLER_SCRIPT,
+    help=(
+        f"Path to jitsi-audio-puller index.js "
+        f"(env {ENV_JITSI_PULLER_SCRIPT}, default: <project-root>/jitsi-audio-puller/index.js)."
+    ),
+)
+@click.option("--ffmpeg", "ffmpeg_bin", default="ffmpeg", show_default=True, help="ffmpeg executable.")
+@click.option("--sample-rate", type=int, default=16000, show_default=True)
+@click.option("--pcm-format", "pcm_format", default="s16", show_default=True)
+@click.option("--step", "step_ms", type=int, default=1000, show_default=True)
+@click.option("--length", "length_ms", type=int, default=10000, show_default=True)
+@click.option("--keep", "keep_ms", type=int, default=500, show_default=True)
+@click.option(
+    "--whisper-cpp-home",
+    type=str,
+    default=None,
+    envvar=ENV_WHISPER_CPP_HOME,
+    help=(
+        "whisper.cpp checkout root; defaults to $PWD/whisper.cpp when unset. "
+        "Fills in binary build/bin/whisper-stream-pcm and model "
+        f"models/{WHISPER_CPP_DEFAULT_MODEL} under that root "
+        f"(env {ENV_WHISPER_CPP_HOME})."
+    ),
+)
+@click.option(
+    "--whisper-binary",
+    type=str,
+    default=None,
+    envvar=ENV_WHISPER_BINARY,
+    help=(
+        "path to whisper-stream-pcm (overrides home default; "
+        f"or env {ENV_WHISPER_BINARY})."
+    ),
+)
+@click.option(
+    "--model",
+    "-m",
+    "model_path",
+    type=str,
+    default=None,
+    envvar=ENV_WHISPER_MODEL,
+    help=(
+        "ggml model path or filename under models/ when using "
+        "--whisper-cpp-home or $PWD/whisper.cpp defaults "
+        f"(or env {ENV_WHISPER_MODEL})."
+    ),
+)
+@click.option(
+    "--extra-whisper-args",
+    type=str,
+    default="",
+    help="Extra whisper-stream-pcm arguments as one string (parsed with shlex.split).",
+)
+@click.option(
+    "--line-kind",
+    type=click.Choice(["auto", "final", "partial"]),
+    default="auto",
+    show_default=True,
+    help=(
+        "auto: interim \\r rewrites publish as partial, completed \\n lines as final. "
+        "final/partial: only \\n-terminated lines emit, fixed kind (legacy)."
+    ),
+)
+@click.option("--debounce-ms", type=int, default=400, show_default=True)
+@click.option("--min-interval-ms", type=int, default=450, show_default=True)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Print the node and ffmpeg | whisper commands and exit (no Ably, no subprocess).",
+)
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    help="Echo whisper's raw stdout bytes to stderr.",
+)
+def whisper_jitsi(
+    channel: str,
+    publisher_token: str | None,
+    jitsi_url: str,
+    node_bin: str,
+    jitsi_puller_script: str | None,
+    ffmpeg_bin: str,
+    sample_rate: int,
+    pcm_format: str,
+    step_ms: int,
+    length_ms: int,
+    keep_ms: int,
+    whisper_cpp_home: str | None,
+    whisper_binary: str | None,
+    model_path: str | None,
+    extra_whisper_args: str,
+    line_kind: str,
+    debounce_ms: int,
+    min_interval_ms: int,
+    dry_run: bool,
+    verbose: bool,
+) -> None:
+    """Jitsi meeting → ffmpeg (WAV) → whisper-stream-pcm; publish stdout lines to Ably."""
+    _run_whisper_jitsi(
+        channel,
+        publisher_token or "",
+        jitsi_url=jitsi_url,
+        node_bin=node_bin,
+        puller_script=jitsi_puller_script or default_jitsi_puller_script(),
+        ffmpeg_bin=ffmpeg_bin,
         sample_rate=sample_rate,
         pcm_format=pcm_format,
         step_ms=step_ms,
