@@ -158,6 +158,10 @@
       color: var(--muted);
       font-weight: 400;
     }
+    .speaker-prefix {
+      color: var(--muted);
+      font-weight: 500;
+    }
     #auth-panel.subscriber-online {
       display: none;
     }
@@ -423,6 +427,72 @@
       return String(k ?? "").trim().toLowerCase() === "final" ? "final" : "partial";
     }
 
+    function speakerLabel(data) {
+      const sp = data && data.speaker;
+      if (!sp || typeof sp !== "object") return "";
+      const name = String(sp.name ?? "").trim();
+      if (name) return name;
+      return String(sp.id ?? "").trim();
+    }
+
+    function formatSpeakerLine(label, text) {
+      const body = String(text ?? "").trim();
+      const name = String(label ?? "").trim();
+      if (!name) return body;
+      if (!body) return name + ":";
+      return name + ": " + body;
+    }
+
+    function setCurrentCaption(text, label) {
+      el.current.textContent = "";
+      el.current.classList.add("partial");
+      const line = String(text ?? "").trim();
+      if (!line) return;
+      const colon = line.indexOf(": ");
+      if (colon >= 0) {
+        const prefix = document.createElement("span");
+        prefix.className = "speaker-prefix";
+        prefix.textContent = line.slice(0, colon + 1) + " ";
+        el.current.appendChild(prefix);
+        el.current.appendChild(document.createTextNode(line.slice(colon + 2)));
+        return;
+      }
+      el.current.textContent = line;
+    }
+
+    function appendSpeakerHistoryLine(label, text) {
+      const line = String(text ?? "").trim();
+      if (!line) return;
+      const colon = line.indexOf(": ");
+      if (colon >= 0) {
+        const p = document.createElement("p");
+        const prefix = document.createElement("span");
+        prefix.className = "speaker-prefix";
+        prefix.textContent = line.slice(0, colon + 1) + " ";
+        p.appendChild(prefix);
+        p.appendChild(document.createTextNode(line.slice(colon + 2)));
+        const stickIfAdded = historyPinnedToLatest();
+        el.historyLines.appendChild(p);
+        trimHistoryIfNeeded();
+        if (stickIfAdded) {
+          requestAnimationFrame(() => {
+            scrollHistoryToLatest();
+          });
+        }
+        return;
+      }
+      appendHistoryLine(line, false);
+    }
+
+    function captionedText(data) {
+      const raw = normalizeWhisperStdoutLine((data && data.text) || "");
+      const label = speakerLabel(data);
+      if (!label) return raw;
+      const prefix = label + ": ";
+      if (raw.startsWith(prefix)) return raw;
+      return formatSpeakerLine(label, raw);
+    }
+
     function applyCaption(msg) {
       const rawPayload = msg && Object.prototype.hasOwnProperty.call(msg, "data") ? msg.data : msg;
       const data = captionPayload(rawPayload);
@@ -433,9 +503,9 @@
         el.current.classList.remove("partial");
         return;
       }
-      const raw = (data && data.text) || "";
-      const text = normalizeWhisperStdoutLine(raw);
       const kind = captionMessageKind(data);
+      const label = speakerLabel(data);
+      const text = captionedText(data);
       if (kind === "final") {
         let historyLine = text;
         if (!historyLine) {
@@ -445,13 +515,12 @@
           }
         }
         if (historyLine) {
-          appendHistoryLine(historyLine, false);
+          appendSpeakerHistoryLine(label, historyLine);
         }
         el.current.textContent = "";
         el.current.classList.remove("partial");
       } else {
-        el.current.textContent = text;
-        el.current.classList.add("partial");
+        setCurrentCaption(text, label);
       }
     }
 

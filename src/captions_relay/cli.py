@@ -39,6 +39,7 @@ from captions_relay.pulse_captions import (
     build_jitsi_pipeline_command,
     build_pulse_pipeline_command,
     run_jitsi_caption_pipeline,
+    run_jitsi_per_speaker_caption_pipeline,
     run_pulse_caption_pipeline,
 )
 
@@ -191,6 +192,19 @@ def session() -> None:
         "Errors out if no valid cached session exists. Cannot be combined with --channel or --json."
     ),
 )
+@click.option(
+    "--mixed",
+    "jitsi_mixed",
+    is_flag=True,
+    help="With --jitsi: sum all participants into one whisper stream (legacy mode).",
+)
+@click.option(
+    "--max-speakers",
+    type=int,
+    default=8,
+    show_default=True,
+    help="With --jitsi (default per-speaker mode): max concurrent whisper instances.",
+)
 def session_new(
     ttl: int | None,
     as_json: bool,
@@ -204,6 +218,8 @@ def session_new(
     node_bin: str | None,
     jitsi_puller_script: str | None,
     reconnect: bool,
+    jitsi_mixed: bool,
+    max_speakers: int,
 ) -> None:
     """Generate a channel name and short-lived publisher/subscriber tokens."""
     if start_pulse and as_json:
@@ -301,6 +317,8 @@ def session_new(
             whisper_binary=whisper_binary,
             model_path=model_path,
             verbose=verbose,
+            mixed=jitsi_mixed,
+            max_speakers=max_speakers,
         )
 
 
@@ -607,6 +625,8 @@ def _run_whisper_jitsi(
     min_interval_ms: int = 450,
     dry_run: bool = False,
     verbose: bool = False,
+    mixed: bool = False,
+    max_speakers: int = 8,
 ) -> None:
     """Shared implementation for ``whisper jitsi`` and ``session new --jitsi``."""
     import tempfile
@@ -637,42 +657,65 @@ def _run_whisper_jitsi(
     except ValueError as e:
         raise click.BadParameter(str(e), param_hint="extra-whisper-args") from e
 
-    fifo_path = tempfile.mktemp(suffix=".pcm", prefix="jitsi-audio-")  # noqa: S306
-
-    shell_cmd = build_jitsi_pipeline_command(
-        ffmpeg_bin=ffmpeg_bin,
-        pipe_path=fifo_path,
-        sample_rate=sample_rate,
-        whisper_bin=wb,
-        model_path=mp,
-        pcm_format=pcm_format,
-        step_ms=step_ms,
-        length_ms=length_ms,
-        keep_ms=keep_ms,
-        extra_whisper_args=extras,
-    )
+    def _shell_for_pipe(pipe_path: str) -> str:
+        return build_jitsi_pipeline_command(
+            ffmpeg_bin=ffmpeg_bin,
+            pipe_path=pipe_path,
+            sample_rate=sample_rate,
+            whisper_bin=wb,
+            model_path=mp,
+            pcm_format=pcm_format,
+            step_ms=step_ms,
+            length_ms=length_ms,
+            keep_ms=keep_ms,
+            extra_whisper_args=extras,
+        )
 
     if dry_run:
-        click.echo(f"node {shlex.quote(script)} {shlex.quote(jitsi_url)} {shlex.quote(fifo_path)}")
-        click.echo(shell_cmd)
+        if mixed:
+            fifo_path = tempfile.mktemp(suffix=".pcm", prefix="jitsi-audio-")  # noqa: S306
+            click.echo(
+                f"node {shlex.quote(script)} {shlex.quote(jitsi_url)} --mixed {shlex.quote(fifo_path)}"
+            )
+            click.echo(_shell_for_pipe(fifo_path))
+        else:
+            click.echo(
+                f"node {shlex.quote(script)} {shlex.quote(jitsi_url)} --per-speaker --pipe-dir <tmpdir>"
+            )
+            click.echo(_shell_for_pipe("<track-fifo>"))
+            click.echo(f"# max concurrent whisper instances: {max_speakers}")
         return
 
-    import os as _os
-    _os.mkfifo(fifo_path)
-
     async def _run() -> int:
-        return await run_jitsi_caption_pipeline(
+        if mixed:
+            fifo_path = tempfile.mktemp(suffix=".pcm", prefix="jitsi-audio-")  # noqa: S306
+            return await run_jitsi_caption_pipeline(
+                channel=ch,
+                publisher_token=tok,
+                jitsi_url=jitsi_url,
+                node_bin=node_bin,
+                puller_script=script,
+                shell_command=_shell_for_pipe(fifo_path),
+                fifo_path=fifo_path,
+                line_kind=line_kind,
+                debounce_ms=debounce_ms,
+                min_interval_ms=min_interval_ms,
+                quiet_ably_logs=True,
+                verbose_echo_whisper=verbose,
+            )
+
+        return await run_jitsi_per_speaker_caption_pipeline(
             channel=ch,
             publisher_token=tok,
             jitsi_url=jitsi_url,
             node_bin=node_bin,
             puller_script=script,
-            shell_command=shell_cmd,
-            fifo_path=fifo_path,
+            shell_command_for_pipe=_shell_for_pipe,
             line_kind=line_kind,
             debounce_ms=debounce_ms,
             min_interval_ms=min_interval_ms,
             quiet_ably_logs=True,
+            max_speakers=max_speakers,
             verbose_echo_whisper=verbose,
         )
 
@@ -939,6 +982,19 @@ def whisper_pulse(
         "Errors out if no valid cached session exists for the channel."
     ),
 )
+@click.option(
+    "--mixed",
+    "mixed",
+    is_flag=True,
+    help="Sum all participants into one whisper stream (legacy mode). Default is per-speaker.",
+)
+@click.option(
+    "--max-speakers",
+    type=int,
+    default=8,
+    show_default=True,
+    help="Max concurrent whisper instances in per-speaker mode.",
+)
 def whisper_jitsi(
     channel: str,
     publisher_token: str | None,
@@ -961,6 +1017,8 @@ def whisper_jitsi(
     dry_run: bool,
     verbose: bool,
     reconnect: bool,
+    mixed: bool,
+    max_speakers: int,
 ) -> None:
     """Jitsi meeting → ffmpeg (WAV) → whisper-stream-pcm; publish stdout lines to Ably."""
     if reconnect:
@@ -995,4 +1053,6 @@ def whisper_jitsi(
         min_interval_ms=min_interval_ms,
         dry_run=dry_run,
         verbose=verbose,
+        mixed=mixed,
+        max_speakers=max_speakers,
     )

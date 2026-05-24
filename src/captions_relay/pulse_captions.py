@@ -6,16 +6,20 @@ import asyncio
 import codecs
 import contextlib
 import fcntl
+import json
 import logging
 import os
 import pty
 import re
 import shlex
+import shutil
 import signal
 import struct
 import sys
+import tempfile
 import termios
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from ably.realtime.realtime import AblyRealtime
@@ -418,6 +422,456 @@ async def _pulse_push_caption_events(throttle: CaptionThrottle, events: list[tup
         await throttle.push(text, kind)
 
 
+@dataclass(frozen=True)
+class SpeakerInfo:
+    participant_id: str
+    name: str
+
+
+def format_speaker_line(name: str | None, text: str) -> str:
+    """Format a caption line with an optional speaker prefix (mirrors subscriber UI)."""
+    label = (name or "").strip()
+    body = text.strip()
+    if not label:
+        return body
+    if not body:
+        return f"{label}:"
+    return f"{label}: {body}"
+
+
+def build_caption_body(
+    text: str,
+    kind: str,
+    *,
+    speaker: SpeakerInfo | None = None,
+) -> dict:
+    body = {
+        "t": datetime.now(timezone.utc).isoformat(),
+        "text": text.strip(),
+        "kind": "final" if kind == "final" else "partial",
+    }
+    if speaker is not None:
+        body["speaker"] = {"id": speaker.participant_id, "name": speaker.name}
+    return body
+
+
+def _speaker_publish(
+    ch,
+    speaker: SpeakerInfo,
+) -> Callable[[dict], Awaitable[None]]:
+    async def publish(body: dict) -> None:
+        text = str(body.get("text", "")).strip()
+        payload = {
+            **body,
+            "text": format_speaker_line(speaker.name, text),
+            "speaker": {"id": speaker.participant_id, "name": speaker.name},
+        }
+        await ch.publish(CAPTION_EVENT, payload)
+
+    return publish
+
+
+async def _run_whisper_shell_loop(
+    *,
+    shell_command: str,
+    throttle: CaptionThrottle,
+    line_kind: str,
+    verbose_echo_whisper: bool,
+    stopped: asyncio.Event | None = None,
+) -> int:
+    """Run one ``ffmpeg | whisper`` shell pipeline until it exits or ``stopped`` is set."""
+    proc: asyncio.subprocess.Process | None = None
+    exit_code = 0
+    transport: asyncio.BaseTransport | None = None
+    master_fd: int | None = None
+    slave_fd: int | None = None
+    loop = asyncio.get_running_loop()
+    stop_event = stopped or asyncio.Event()
+
+    try:
+        master_fd, slave_fd = pty.openpty()
+        _pulse_pty_set_winsize(slave_fd)
+        proc = await asyncio.create_subprocess_shell(
+            shell_command,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=slave_fd,
+            stderr=None,
+            start_new_session=True,
+        )
+        os.close(slave_fd)
+        slave_fd = None
+
+        reader = asyncio.StreamReader()
+        pipe_f = os.fdopen(master_fd, "rb", buffering=0, closefd=True)
+        master_fd = None
+        transport, _ = await loop.connect_read_pipe(
+            lambda: asyncio.StreamReaderProtocol(reader),
+            pipe_f,
+        )
+
+        proc_wait = asyncio.create_task(proc.wait())
+        whisper_out = WhisperStdoutStreamProcessor(line_kind=line_kind)
+        try:
+            breaking = False
+            while not breaking:
+                read_task = asyncio.create_task(reader.read(_PULSE_WHISPER_READ_CHUNK))
+                stop_task = asyncio.create_task(stop_event.wait())
+                done_tasks, _ = await asyncio.wait(
+                    {read_task, stop_task, proc_wait},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                if stop_task in done_tasks:
+                    read_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await read_task
+                    if not proc_wait.done():
+                        proc_wait.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await proc_wait
+                    breaking = True
+                    continue
+
+                if proc_wait in done_tasks:
+                    read_task.cancel()
+                    stop_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, OSError):
+                        await read_task
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await stop_task
+                    breaking = True
+                    continue
+
+                stop_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await stop_task
+
+                try:
+                    chunk = read_task.result()
+                except OSError:
+                    breaking = True
+                    continue
+
+                if not chunk:
+                    breaking = True
+                    continue
+
+                if verbose_echo_whisper:
+                    sys.stderr.buffer.write(chunk)
+                    sys.stderr.buffer.flush()
+                await _pulse_push_caption_events(throttle, whisper_out.feed(chunk))
+
+            if not stop_event.is_set():
+                while True:
+                    try:
+                        chunk = await reader.read(_PULSE_WHISPER_READ_CHUNK)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    if verbose_echo_whisper:
+                        sys.stderr.buffer.write(chunk)
+                        sys.stderr.buffer.flush()
+                    await _pulse_push_caption_events(throttle, whisper_out.feed(chunk))
+
+            await _pulse_push_caption_events(throttle, whisper_out.close())
+        finally:
+            if not proc_wait.done():
+                proc_wait.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await proc_wait
+    finally:
+        if slave_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(slave_fd)
+        if master_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(master_fd)
+        if transport is not None:
+            transport.close()
+        if proc is not None and proc.returncode is None:
+            _terminate_pulse_pipeline_proc(proc)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=8.0)
+            except TimeoutError:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    if proc.pid is not None:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                await proc.wait()
+
+    if proc is not None:
+        exit_code = proc.returncode if proc.returncode is not None else 0
+    return exit_code
+
+
+class SpeakerPipelineTask:
+    """One remote audio track → one whisper subprocess → Ably publishes with speaker metadata."""
+
+    def __init__(
+        self,
+        *,
+        track_id: str,
+        speaker: SpeakerInfo,
+        pipe_path: str,
+        shell_command: str,
+        publish: Callable[[dict], Awaitable[None]],
+        line_kind: str,
+        debounce_ms: int,
+        min_interval_ms: int,
+        verbose_echo_whisper: bool,
+        on_exit: Callable[[str], Awaitable[None]] | None = None,
+    ) -> None:
+        self.track_id = track_id
+        self.speaker = speaker
+        self.pipe_path = pipe_path
+        self.shell_command = shell_command
+        self._publish = publish
+        self._line_kind = line_kind
+        self._debounce_ms = debounce_ms
+        self._min_interval_ms = min_interval_ms
+        self._verbose_echo_whisper = verbose_echo_whisper
+        self._on_exit = on_exit
+        self._stopped = asyncio.Event()
+        self._task: asyncio.Task[int] | None = None
+        self._throttle: CaptionThrottle | None = None
+
+    def is_running(self) -> bool:
+        return self._task is not None and not self._task.done()
+
+    async def start(self) -> None:
+        if self.is_running():
+            return
+        if self._task is not None:
+            self._task = None
+            if self._throttle is not None:
+                await self._throttle.aclose()
+                self._throttle = None
+        self._stopped.clear()
+        self._throttle = CaptionThrottle(
+            self._publish,
+            debounce_s=self._debounce_ms / 1000.0,
+            min_interval_s=self._min_interval_ms / 1000.0,
+        )
+        self._task = asyncio.create_task(self._run())
+
+    async def _run(self) -> int:
+        assert self._throttle is not None
+        exit_cb = self._on_exit
+        try:
+            return await _run_whisper_shell_loop(
+                shell_command=self.shell_command,
+                throttle=self._throttle,
+                line_kind=self._line_kind,
+                verbose_echo_whisper=self._verbose_echo_whisper,
+                stopped=self._stopped,
+            )
+        finally:
+            await self._throttle.aclose()
+            intentional = self._stopped.is_set()
+            self._task = None
+            self._throttle = None
+            if exit_cb is not None and not intentional:
+                with contextlib.suppress(Exception):
+                    await exit_cb(self.track_id)
+
+    async def stop(self) -> None:
+        self._stopped.set()
+        if self._task is None:
+            return
+        try:
+            await asyncio.wait_for(self._task, timeout=10.0)
+        except TimeoutError:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+        self._task = None
+        if self._throttle is not None:
+            await self._throttle.aclose()
+            self._throttle = None
+
+
+class SpeakerOrchestrator:
+    """Manage per-track whisper pipelines driven by jitsi-audio-puller stdout control events."""
+
+    def __init__(
+        self,
+        *,
+        ch,
+        shell_command_for_pipe: Callable[[str], str],
+        line_kind: str,
+        debounce_ms: int,
+        min_interval_ms: int,
+        max_speakers: int,
+        verbose_echo_whisper: bool,
+    ) -> None:
+        self._ch = ch
+        self._shell_command_for_pipe = shell_command_for_pipe
+        self._line_kind = line_kind
+        self._debounce_ms = debounce_ms
+        self._min_interval_ms = min_interval_ms
+        self._max_speakers = max_speakers
+        self._verbose_echo_whisper = verbose_echo_whisper
+        self._pipelines: dict[str, SpeakerPipelineTask] = {}
+        self._track_speakers: dict[str, SpeakerInfo] = {}
+        self._muted_tracks: set[str] = set()
+        self._waiting_for_slot: set[str] = set()
+
+    def _running_count(self) -> int:
+        return sum(1 for p in self._pipelines.values() if p.is_running())
+
+    async def _on_pipeline_exit(self, track_id: str) -> None:
+        if track_id not in self._pipelines or track_id in self._muted_tracks:
+            return
+        speaker = self._track_speakers.get(track_id)
+        label = speaker.name if speaker else track_id
+        log.warning("Whisper exited unexpectedly for %s — restarting in 1s", label)
+        await asyncio.sleep(1.0)
+        if track_id in self._pipelines and track_id not in self._muted_tracks:
+            await self._try_start_pipeline(track_id)
+
+    async def _try_start_pipeline(self, track_id: str) -> None:
+        pipeline = self._pipelines.get(track_id)
+        if pipeline is None or track_id in self._muted_tracks:
+            return
+        if pipeline.is_running():
+            return
+        if self._running_count() >= self._max_speakers:
+            if track_id not in self._waiting_for_slot:
+                speaker = self._track_speakers.get(track_id)
+                label = speaker.name if speaker else track_id
+                self._waiting_for_slot.add(track_id)
+                log.warning(
+                    "Max speakers (%s) reached — %s waiting for a transcription slot",
+                    self._max_speakers,
+                    label,
+                )
+            return
+
+        self._waiting_for_slot.discard(track_id)
+        await pipeline.start()
+        speaker = self._track_speakers.get(track_id)
+        label = speaker.name if speaker else track_id
+        log.info("Started per-speaker whisper for %s (%s)", label, track_id)
+
+    async def _promote_waiting(self) -> None:
+        for track_id in list(self._waiting_for_slot):
+            if self._running_count() >= self._max_speakers:
+                break
+            await self._try_start_pipeline(track_id)
+
+    async def aclose(self) -> None:
+        await self._stop_all()
+
+    async def _stop_all(self) -> None:
+        tasks = [p.stop() for p in self._pipelines.values()]
+        self._pipelines.clear()
+        self._track_speakers.clear()
+        self._muted_tracks.clear()
+        self._waiting_for_slot.clear()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def handle_control_line(self, line: str) -> None:
+        line = line.strip()
+        if not line:
+            return
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            log.debug("Ignoring non-JSON puller stdout: %s", line[:120])
+            return
+
+        event = msg.get("event")
+        if event == "ready":
+            log.info("Jitsi puller ready — waiting for remote audio tracks")
+            return
+
+        if event != "track":
+            return
+
+        action = msg.get("action")
+        track_id = msg.get("trackId")
+        if not track_id:
+            return
+
+        if action == "added":
+            await self._on_track_added(msg)
+        elif action == "removed":
+            await self._on_track_removed(track_id)
+        elif action == "mute":
+            await self._on_track_mute(track_id, bool(msg.get("muted")))
+
+    async def _on_track_added(self, msg: dict) -> None:
+        track_id = str(msg["trackId"])
+        participant_id = str(msg.get("participantId") or track_id)
+        name = str(msg.get("name") or participant_id)
+        pipe_path = str(msg.get("pipe") or "")
+        if not pipe_path:
+            log.warning("Track added without pipe path: %s", track_id)
+            return
+
+        if track_id in self._pipelines:
+            return
+
+        if track_id in self._pipelines:
+            return
+
+        speaker = SpeakerInfo(participant_id=participant_id, name=name)
+        self._track_speakers[track_id] = speaker
+        pipeline = SpeakerPipelineTask(
+            track_id=track_id,
+            speaker=speaker,
+            pipe_path=pipe_path,
+            shell_command=self._shell_command_for_pipe(pipe_path),
+            publish=_speaker_publish(self._ch, speaker),
+            line_kind=self._line_kind,
+            debounce_ms=self._debounce_ms,
+            min_interval_ms=self._min_interval_ms,
+            verbose_echo_whisper=self._verbose_echo_whisper,
+            on_exit=self._on_pipeline_exit,
+        )
+        self._pipelines[track_id] = pipeline
+        if msg.get("muted"):
+            self._muted_tracks.add(track_id)
+            log.info("Track added (muted): %s (%s)", name, track_id)
+            return
+
+        await self._try_start_pipeline(track_id)
+
+    async def _on_track_removed(self, track_id: str) -> None:
+        pipeline = self._pipelines.pop(track_id, None)
+        self._track_speakers.pop(track_id, None)
+        self._muted_tracks.discard(track_id)
+        self._waiting_for_slot.discard(track_id)
+        if pipeline is not None:
+            await pipeline.stop()
+            log.info("Stopped per-speaker whisper for track %s", track_id)
+        await self._promote_waiting()
+
+    async def _on_track_mute(self, track_id: str, muted: bool) -> None:
+        pipeline = self._pipelines.get(track_id)
+        if pipeline is None:
+            log.warning(
+                "Mute event for unknown track %s (muted=%s) — no whisper pipeline",
+                track_id,
+                muted,
+            )
+            return
+        if muted:
+            self._muted_tracks.add(track_id)
+            self._waiting_for_slot.discard(track_id)
+            await pipeline.stop()
+            log.info("Paused whisper for muted track %s", track_id)
+            await self._promote_waiting()
+            return
+
+        self._muted_tracks.discard(track_id)
+        await self._try_start_pipeline(track_id)
+        log.info("Resumed whisper for unmuted track %s", track_id)
+
+
 async def wait_ably_connected(realtime: AblyRealtime, *, timeout_s: float = 30.0) -> None:
     deadline = asyncio.get_running_loop().time() + timeout_s
     while asyncio.get_running_loop().time() < deadline:
@@ -526,7 +980,7 @@ async def run_pulse_caption_pipeline(
                     if proc_wait in done_tasks:
                         read_task.cancel()
                         stop_task.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
+                        with contextlib.suppress(asyncio.CancelledError, OSError):
                             await read_task
                         with contextlib.suppress(asyncio.CancelledError):
                             await stop_task
@@ -537,7 +991,12 @@ async def run_pulse_caption_pipeline(
                     with contextlib.suppress(asyncio.CancelledError):
                         await stop_task
 
-                    chunk = read_task.result()
+                    try:
+                        chunk = read_task.result()
+                    except OSError:
+                        # PTY hangup (EIO) when the subprocess exits abruptly; treat as EOF.
+                        breaking = True
+                        continue
 
                     if not chunk:
                         breaking = True
@@ -550,7 +1009,11 @@ async def run_pulse_caption_pipeline(
 
                 if not user_stopped:
                     while True:
-                        chunk = await reader.read(_PULSE_WHISPER_READ_CHUNK)
+                        try:
+                            chunk = await reader.read(_PULSE_WHISPER_READ_CHUNK)
+                        except OSError:
+                            # PTY hangup (EIO) after subprocess exit; treat as EOF.
+                            break
                         if not chunk:
                             break
                         if verbose_echo_whisper:
@@ -607,6 +1070,16 @@ async def run_pulse_caption_pipeline(
     return exit_code
 
 
+# Node exit code that signals a transient Jitsi failure (shard change, connection
+# drop, conference failed) — Python should recreate the FIFO and retry.
+_NODE_RETRY_EXIT = 1
+_RETRY_BASE_DELAY = 2.0
+_RETRY_MAX_DELAY = 30.0
+# If an attempt stayed alive this long it probably connected successfully, so
+# reset the backoff delay rather than continuing to increase it.
+_RETRY_LONG_RUN_THRESHOLD = 10.0
+
+
 async def run_jitsi_caption_pipeline(
     *,
     channel: str,
@@ -624,43 +1097,256 @@ async def run_jitsi_caption_pipeline(
 ) -> int:
     """Start ``node jitsi-audio-puller`` then run ``run_pulse_caption_pipeline``.
 
-    The caller is responsible for pre-creating ``fifo_path`` with ``os.mkfifo``
-    before calling this coroutine.  This function terminates the node process and
-    removes the FIFO in its ``finally`` block regardless of how the pipeline exits.
-    """
-    node_proc: asyncio.subprocess.Process | None = None
-    try:
-        node_proc = await asyncio.create_subprocess_exec(
-            node_bin,
-            puller_script,
-            jitsi_url,
-            fifo_path,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=None,
-        )
-        log.info("Started jitsi-audio-puller (pid %s) for %s", node_proc.pid, jitsi_url)
+    The FIFO at ``fifo_path`` is created (and recreated on each retry) by this
+    function.  The caller must NOT pre-create it.  The FIFO is removed in the
+    outer ``finally`` block once all retry attempts are exhausted.
 
-        exit_code = await run_pulse_caption_pipeline(
-            channel=channel,
-            publisher_token=publisher_token,
-            shell_command=shell_command,
-            line_kind=line_kind,
-            debounce_ms=debounce_ms,
-            min_interval_ms=min_interval_ms,
-            quiet_ably_logs=quiet_ably_logs,
-            verbose_echo_whisper=verbose_echo_whisper,
-        )
-    finally:
-        if node_proc is not None and node_proc.returncode is None:
-            node_proc.terminate()
+    When the Node process exits with :data:`_NODE_RETRY_EXIT` (transient Jitsi
+    failure: shard change, connection drop, conference failed) the pipeline is
+    restarted automatically with exponential backoff up to
+    :data:`_RETRY_MAX_DELAY` seconds.  Any other exit code ends the loop.
+    """
+    delay = _RETRY_BASE_DELAY
+    attempt = 0
+    exit_code = 0
+
+    try:
+        while True:
+            # Recreate the FIFO fresh for each attempt (same path, new inode).
+            with contextlib.suppress(FileNotFoundError, OSError):
+                os.unlink(fifo_path)
+            os.mkfifo(fifo_path)
+
+            node_proc: asyncio.subprocess.Process | None = None
+            node_exit: int | None = None
+            attempt_start = asyncio.get_event_loop().time()
             try:
-                await asyncio.wait_for(node_proc.wait(), timeout=5.0)
-            except TimeoutError:
-                with contextlib.suppress(ProcessLookupError, PermissionError):
-                    node_proc.kill()
-                await node_proc.wait()
+                node_proc = await asyncio.create_subprocess_exec(
+                    node_bin,
+                    puller_script,
+                    jitsi_url,
+                    "--mixed",
+                    fifo_path,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=None,
+                    stderr=None,
+                )
+                if attempt == 0:
+                    log.info("Started jitsi-audio-puller (pid %s) for %s", node_proc.pid, jitsi_url)
+                else:
+                    log.info(
+                        "Restarted jitsi-audio-puller (pid %s) for %s (attempt %s)",
+                        node_proc.pid, jitsi_url, attempt + 1,
+                    )
+
+                exit_code = await run_pulse_caption_pipeline(
+                    channel=channel,
+                    publisher_token=publisher_token,
+                    shell_command=shell_command,
+                    line_kind=line_kind,
+                    debounce_ms=debounce_ms,
+                    min_interval_ms=min_interval_ms,
+                    quiet_ably_logs=quiet_ably_logs,
+                    verbose_echo_whisper=verbose_echo_whisper,
+                )
+            finally:
+                if node_proc is not None:
+                    if node_proc.returncode is None:
+                        node_proc.terminate()
+                        try:
+                            await asyncio.wait_for(node_proc.wait(), timeout=5.0)
+                        except TimeoutError:
+                            with contextlib.suppress(ProcessLookupError, PermissionError):
+                                node_proc.kill()
+                            await node_proc.wait()
+                    node_exit = node_proc.returncode
+
+            elapsed = asyncio.get_event_loop().time() - attempt_start
+            if node_exit == _NODE_RETRY_EXIT:
+                if elapsed >= _RETRY_LONG_RUN_THRESHOLD:
+                    delay = _RETRY_BASE_DELAY
+                log.info(
+                    "Jitsi connection lost (transient), reconnecting in %.0fs…",
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                if elapsed < _RETRY_LONG_RUN_THRESHOLD:
+                    delay = min(delay * 2, _RETRY_MAX_DELAY)
+                attempt += 1
+                continue
+
+            break
+    finally:
         with contextlib.suppress(FileNotFoundError, OSError):
             os.unlink(fifo_path)
 
     return exit_code
+
+
+async def run_jitsi_per_speaker_caption_pipeline(
+    *,
+    channel: str,
+    publisher_token: str,
+    jitsi_url: str,
+    node_bin: str,
+    puller_script: str,
+    shell_command_for_pipe: Callable[[str], str],
+    line_kind: str,
+    debounce_ms: int,
+    min_interval_ms: int,
+    quiet_ably_logs: bool,
+    max_speakers: int = 8,
+    verbose_echo_whisper: bool = False,
+) -> int:
+    """Start per-track jitsi-audio-puller and spawn one whisper pipeline per remote speaker."""
+    if sys.platform == "win32":
+        raise RuntimeError("jitsi capture is Unix-only; use WSL or a different audio source.")
+
+    if quiet_ably_logs:
+        logging.getLogger("ably").setLevel(logging.WARNING)
+
+    delay = _RETRY_BASE_DELAY
+    attempt = 0
+    exit_code = 0
+
+    while True:
+        pipe_dir = tempfile.mkdtemp(prefix="jitsi-speakers-")
+        node_proc: asyncio.subprocess.Process | None = None
+        node_exit: int | None = None
+        attempt_start = asyncio.get_event_loop().time()
+        realtime: AblyRealtime | None = None
+        orchestrator: SpeakerOrchestrator | None = None
+        stopped = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def _on_shutdown_signal() -> None:
+            stopped.set()
+            if node_proc is not None and node_proc.returncode is None:
+                node_proc.terminate()
+
+        loop.add_signal_handler(signal.SIGINT, _on_shutdown_signal)
+        loop.add_signal_handler(signal.SIGTERM, _on_shutdown_signal)
+
+        try:
+            node_proc = await asyncio.create_subprocess_exec(
+                node_bin,
+                puller_script,
+                jitsi_url,
+                "--per-speaker",
+                "--pipe-dir",
+                pipe_dir,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=None,
+            )
+            if attempt == 0:
+                log.info(
+                    "Started jitsi-audio-puller (pid %s, per-speaker) for %s",
+                    node_proc.pid,
+                    jitsi_url,
+                )
+            else:
+                log.info(
+                    "Restarted jitsi-audio-puller (pid %s, per-speaker) for %s (attempt %s)",
+                    node_proc.pid,
+                    jitsi_url,
+                    attempt + 1,
+                )
+
+            realtime = AblyRealtime(token=publisher_token.strip())
+            await wait_ably_connected(realtime)
+            ch = realtime.channels.get(channel)
+            orchestrator = SpeakerOrchestrator(
+                ch=ch,
+                shell_command_for_pipe=shell_command_for_pipe,
+                line_kind=line_kind,
+                debounce_ms=debounce_ms,
+                min_interval_ms=min_interval_ms,
+                max_speakers=max_speakers,
+                verbose_echo_whisper=verbose_echo_whisper,
+            )
+
+            assert node_proc.stdout is not None
+            stdout_reader = asyncio.create_task(_read_puller_stdout(node_proc.stdout, orchestrator))
+            node_wait = asyncio.create_task(node_proc.wait())
+            stop_wait = asyncio.create_task(stopped.wait())
+
+            done, _ = await asyncio.wait(
+                {stdout_reader, node_wait, stop_wait},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if stop_wait in done:
+                exit_code = 130
+            elif node_wait in done:
+                exit_code = node_wait.result() or 0
+            else:
+                exit_code = 0
+
+            stdout_reader.cancel()
+            node_wait.cancel()
+            stop_wait.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stdout_reader
+            with contextlib.suppress(asyncio.CancelledError):
+                await node_wait
+            with contextlib.suppress(asyncio.CancelledError):
+                await stop_wait
+
+        finally:
+            with contextlib.suppress(ValueError, NotImplementedError):
+                loop.remove_signal_handler(signal.SIGINT)
+            with contextlib.suppress(ValueError, NotImplementedError):
+                loop.remove_signal_handler(signal.SIGTERM)
+
+            if orchestrator is not None:
+                await orchestrator.aclose()
+            if node_proc is not None and node_proc.returncode is None:
+                node_proc.terminate()
+                try:
+                    await asyncio.wait_for(node_proc.wait(), timeout=5.0)
+                except TimeoutError:
+                    with contextlib.suppress(ProcessLookupError, PermissionError):
+                        node_proc.kill()
+                    await node_proc.wait()
+            if node_proc is not None:
+                node_exit = node_proc.returncode
+            if realtime is not None:
+                await realtime.close()
+            shutil.rmtree(pipe_dir, ignore_errors=True)
+
+        if stopped.is_set():
+            break
+
+        elapsed = asyncio.get_event_loop().time() - attempt_start
+        if node_exit == _NODE_RETRY_EXIT:
+            if elapsed >= _RETRY_LONG_RUN_THRESHOLD:
+                delay = _RETRY_BASE_DELAY
+            log.info(
+                "Jitsi connection lost (transient), reconnecting in %.0fs…",
+                delay,
+            )
+            await asyncio.sleep(delay)
+            if elapsed < _RETRY_LONG_RUN_THRESHOLD:
+                delay = min(delay * 2, _RETRY_MAX_DELAY)
+            attempt += 1
+            continue
+
+        break
+
+    return exit_code
+
+
+async def _read_puller_stdout(
+    stdout: asyncio.StreamReader,
+    orchestrator: SpeakerOrchestrator,
+) -> None:
+    while True:
+        line = await stdout.readline()
+        if not line:
+            break
+        try:
+            text = line.decode("utf-8", errors="replace")
+        except Exception:
+            continue
+        await orchestrator.handle_control_line(text)

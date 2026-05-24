@@ -125,7 +125,7 @@ class CaptionsAblyPublisher {
   }
 
   /**
-   * @param {{ text: string, kind?: 'partial'|'final' }} payload
+   * @param {{ text: string, kind?: 'partial'|'final', speaker?: { id?: string, name?: string } }} payload
    */
   publishCaption(payload) {
     if (!this._channel) {
@@ -138,6 +138,18 @@ class CaptionsAblyPublisher {
       text,
       kind,
     };
+    if (payload.speaker && typeof payload.speaker === "object") {
+      const id = String(payload.speaker.id ?? "").trim();
+      const name = String(payload.speaker.name ?? "").trim();
+      if (id || name) {
+        const label = name || id;
+        body.speaker = { id: id || name, name: label };
+        if (label && text) {
+          const prefix = label + ": ";
+          body.text = text.startsWith(prefix) ? text : prefix + text;
+        }
+      }
+    }
 
     if (kind === "final") {
       if (this._timer) {
