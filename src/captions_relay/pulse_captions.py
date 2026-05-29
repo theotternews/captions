@@ -18,6 +18,7 @@ import struct
 import sys
 import tempfile
 import termios
+import threading
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -417,8 +418,15 @@ def build_pulse_pipeline_command(
     return f"{shlex.join(ffmpeg_argv)} | {shlex.join(whisper_argv)}"
 
 
-async def _pulse_push_caption_events(throttle: CaptionThrottle, events: list[tuple[str, str]]) -> None:
+async def _pulse_push_caption_events(
+    throttle: CaptionThrottle,
+    events: list[tuple[str, str]],
+    *,
+    verbose_speaker: SpeakerInfo | None = None,
+) -> None:
     for text, kind in events:
+        if verbose_speaker is not None:
+            echo_verbose_caption(text, kind, speaker=verbose_speaker)
         await throttle.push(text, kind)
 
 
@@ -437,6 +445,22 @@ def format_speaker_line(name: str | None, text: str) -> str:
     if not body:
         return f"{label}:"
     return f"{label}: {body}"
+
+
+_verbose_stdout_lock = threading.Lock()
+
+
+def echo_verbose_caption(text: str, kind: str, *, speaker: SpeakerInfo | None) -> None:
+    """Mirror subscriber caption lines on stdout when ``-v`` is used (per-speaker Jitsi mode)."""
+    line = format_speaker_line(speaker.name if speaker else None, text)
+    if not line:
+        return
+    with _verbose_stdout_lock:
+        if kind == "final":
+            sys.stdout.write(line + "\n")
+        else:
+            sys.stdout.write("\r" + line)
+        sys.stdout.flush()
 
 
 def build_caption_body(
@@ -477,9 +501,12 @@ async def _run_whisper_shell_loop(
     throttle: CaptionThrottle,
     line_kind: str,
     verbose_echo_whisper: bool,
+    verbose_speaker: SpeakerInfo | None = None,
     stopped: asyncio.Event | None = None,
 ) -> int:
     """Run one ``ffmpeg | whisper`` shell pipeline until it exits or ``stopped`` is set."""
+    echo_raw_whisper = verbose_echo_whisper and verbose_speaker is None
+    echo_caption_speaker = verbose_speaker if verbose_echo_whisper else None
     proc: asyncio.subprocess.Process | None = None
     exit_code = 0
     transport: asyncio.BaseTransport | None = None
@@ -556,10 +583,14 @@ async def _run_whisper_shell_loop(
                     breaking = True
                     continue
 
-                if verbose_echo_whisper:
+                if echo_raw_whisper:
                     sys.stderr.buffer.write(chunk)
                     sys.stderr.buffer.flush()
-                await _pulse_push_caption_events(throttle, whisper_out.feed(chunk))
+                await _pulse_push_caption_events(
+                    throttle,
+                    whisper_out.feed(chunk),
+                    verbose_speaker=echo_caption_speaker,
+                )
 
             if not stop_event.is_set():
                 while True:
@@ -569,12 +600,20 @@ async def _run_whisper_shell_loop(
                         break
                     if not chunk:
                         break
-                    if verbose_echo_whisper:
+                    if echo_raw_whisper:
                         sys.stderr.buffer.write(chunk)
                         sys.stderr.buffer.flush()
-                    await _pulse_push_caption_events(throttle, whisper_out.feed(chunk))
+                    await _pulse_push_caption_events(
+                        throttle,
+                        whisper_out.feed(chunk),
+                        verbose_speaker=echo_caption_speaker,
+                    )
 
-            await _pulse_push_caption_events(throttle, whisper_out.close())
+            await _pulse_push_caption_events(
+                throttle,
+                whisper_out.close(),
+                verbose_speaker=echo_caption_speaker,
+            )
         finally:
             if not proc_wait.done():
                 proc_wait.cancel()
@@ -665,6 +704,7 @@ class SpeakerPipelineTask:
                 throttle=self._throttle,
                 line_kind=self._line_kind,
                 verbose_echo_whisper=self._verbose_echo_whisper,
+                verbose_speaker=self.speaker,
                 stopped=self._stopped,
             )
         finally:

@@ -53,9 +53,13 @@ def _default_ttl() -> int:
 def _room_name_from_jitsi_url(url: str) -> str | None:
     """Extract the lowercased room name from a Jitsi meeting URL, or return ``None``."""
     try:
-        path = urlparse(url).path
-        room = path.strip("/").lower()
-        return room or None
+        parts = [p for p in urlparse(url).path.strip("/").split("/") if p]
+        if not parts:
+            return None
+        # meet.jit.si/moderated/<hash> — MUC room is the hash, not "moderated/<hash>".
+        if parts[0] == "moderated" and len(parts) >= 2:
+            return parts[-1].lower()
+        return "/".join(parts).lower()
     except Exception:
         return None
 
@@ -124,7 +128,10 @@ def session() -> None:
     "-v",
     "--verbose",
     is_flag=True,
-    help="With --pulse: echo raw whisper stdout to stderr (see whisper pulse -v).",
+    help=(
+        "With --pulse: per-speaker Jitsi mode echoes captioned lines (Name: text) to stdout; "
+        "otherwise echoes raw whisper stdout to stderr (see whisper pulse -v)."
+    ),
 )
 @click.option(
     "--whisper-cpp-home",
@@ -971,7 +978,10 @@ def whisper_pulse(
     "-v",
     "--verbose",
     is_flag=True,
-    help="Echo whisper's raw stdout bytes to stderr.",
+    help=(
+        "Per-speaker Jitsi mode: echo captioned lines (Name: text) to stdout. "
+        "Otherwise echo whisper's raw stdout bytes to stderr."
+    ),
 )
 @click.option(
     "--reconnect",

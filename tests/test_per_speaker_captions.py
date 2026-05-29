@@ -10,6 +10,7 @@ from captions_relay.pulse_captions import (
     SpeakerInfo,
     SpeakerOrchestrator,
     build_caption_body,
+    echo_verbose_caption,
     format_speaker_line,
 )
 
@@ -20,6 +21,18 @@ def test_format_speaker_line_with_name() -> None:
 
 def test_format_speaker_line_without_name() -> None:
     assert format_speaker_line(None, "hello world") == "hello world"
+
+
+def test_echo_verbose_caption_final(capsys) -> None:
+    speaker = SpeakerInfo(participant_id="p1", name="Alice")
+    echo_verbose_caption("hello world", "final", speaker=speaker)
+    assert capsys.readouterr().out == "Alice: hello world\n"
+
+
+def test_echo_verbose_caption_partial(capsys) -> None:
+    speaker = SpeakerInfo(participant_id="p1", name="Alice")
+    echo_verbose_caption("hello", "partial", speaker=speaker)
+    assert capsys.readouterr().out == "\rAlice: hello"
 
 
 def test_build_caption_body_includes_speaker() -> None:
