@@ -1,203 +1,220 @@
-# captions-relay
+# Live meeting captions
 
-Python CLI plus static web pages that relay **live caption text** to a small audience over **[Ably](https://ably.com)** pub/sub—a parallel “companion captions” lane alongside **any video meeting**. Whisper / STT stays on your machine; subscribers only receive **short JSON caption events**.
+Share **live captions** with people in your meeting on a phone or second screen—alongside Zoom, Teams, Jitsi, or anything else. Speech is turned into text on **your** computer; viewers only get the caption stream, not your audio.
 
-## Prerequisites
+You need an [Ably](https://ably.com) account (free tier works). The person running captions keeps the main API key private; everyone else gets a short-lived link and token.
 
-- [uv](https://docs.astral.sh/uv/) and Python **3.13+**
-- An Ably account and **root API key** (Dashboard → API keys)
-- For Jitsi capture: **Node.js 20+** and dependencies in [`jitsi-audio-puller/`](jitsi-audio-puller/) (`npm install` there once)
+---
 
-## Install (dev)
+## Before your first meeting
 
-```bash
-cd /path/to/captions-relay
-uv sync
-export CAPTIONS_ABLY_API_KEY='your_app_id.key_id:secret'
-```
+1. **Set up the facilitator laptop** (see [For developers](#for-developers) — install once).
+2. **Create an Ably API key** in the Ably dashboard and save it on the facilitator machine only:
+   ```bash
+   export CAPTIONS_ABLY_API_KEY='your_app_id.key_id:secret'
+   ```
+3. **Install speech-to-text** if you will caption from this machine: [whisper.cpp](https://github.com/ggerganov/whisper.cpp) built on the laptop, plus the path in `WHISPER_CPP_HOME`.
+4. **For Jitsi rooms only:** install [Node.js](https://nodejs.org/) 20+ and run `npm install` once inside the `jitsi-audio-puller` folder in this project.
 
-Keep the root key **only** on the facilitator’s machine (or a future token broker). Browsers get **short-lived tokens** from the CLI.
+---
 
-Optional: `CAPTIONS_SUBSCRIBER_PAGES_BASE` — root URL printed for subscribers (default: hosted GitHub Pages site from this project’s `docs/`). Set this if your fork uses a different static host.
+## Run a caption session
 
-## Create a session
+On the facilitator laptop:
 
 ```bash
 uv run captions session new
 ```
 
-Or JSON for scripting:
+You will get:
+
+- A **subscriber link** — send this to Deaf participants, caption readers, or anyone who needs the text on another device.
+- A **subscriber token** — they paste this on the subscriber page (or it may be in the link flow).
+- A **publisher token** — **keep secret**; only used on the machine that generates captions.
+- A **channel name** — must match on the subscriber link; do not change spelling or capitalization.
+
+Tokens last about **four hours** by default. Start a new session for a new meeting if you want a clean slate.
+
+**Start captioning in the same step** (Linux, audio from this computer):
 
 ```bash
-uv run captions session new --json
-```
-
-**`--pulse`** — After printing the session, start **`whisper pulse`** with the new **channel** and **publisher token** (same requirements as `whisper pulse`: `WHISPER_CPP_HOME` / binary + model env vars). Not compatible with **`--json`**. Use **`-v`** to mirror whisper’s raw stdout bytes on **stderr**.
-
-```bash
-export WHISPER_CPP_HOME=/path/to/whisper.cpp
 uv run captions session new --pulse -v
 ```
 
-This prints:
-
-- **`channel`** — Ably channel name (default new sessions use `captions:<random uuid hex>`)
-- **Subscriber URL** — ready-to-open link to the static subscriber page (GitHub Pages by default; override with `CAPTIONS_SUBSCRIBER_PAGES_BASE`)
-- With **`--json`**: same link as **`subscriber_url`**
-- **`publisher_token`** — **secret**; used in the tab that runs captioning / whisper
-- **`subscriber_token`** — share with Deaf / processing-access participants
-- Default TTL **4 hours** (override with `--ttl` or env `CAPTIONS_TOKEN_TTL`)
-
-Refresh tokens only:
+**Start captioning from an open Jitsi room** (no password or waiting room):
 
 ```bash
-uv run captions tokens publisher <channel>
-uv run captions tokens subscriber <channel>
+uv run captions session new --jitsi 'https://meet.jit.si/YourRoomName' -v
 ```
 
-End a session (subscribers see **Session ended by host** on the static subscriber page):
+The bot joins as **captions-bot**. The room must allow guests in without a lobby.
+
+---
+
+## Subscribers (phones and second screens)
+
+1. Open the **subscriber link** from `session new` (hosted online by default, or a link your facilitator gives you).
+2. Confirm the **channel** in the URL matches what the facilitator printed.
+3. Paste the **subscriber token** and connect.
+4. Captions should appear as the facilitator’s machine publishes them.
+
+If you tested locally, the facilitator may have given you a `http://localhost:…` or LAN address instead—use that on the same Wi‑Fi.
+
+**Stuck on an old session?** Use **Clear saved token** on the subscriber page, then open the new link and token.
+
+---
+
+## Facilitator: where captions come from
+
+| Source | When to use |
+|--------|-------------|
+| **Pulse / system audio** (`--pulse`) | Linux laptop capturing meeting audio (headphones loopback, virtual cable, etc.). |
+| **Jitsi** (`--jitsi <url>`) | Meeting is on Jitsi; this app joins the room and listens. |
+| **Manual test** | Publisher web page to type or paste lines (good for rehearsal). |
+
+For Jitsi, install Node dependencies once:
+
+```bash
+cd jitsi-audio-puller && npm install && cd ..
+```
+
+To resume the same Jitsi room without minting new tokens, add `--reconnect` to `session new --jitsi …` (only if you already ran a session for that room on this machine).
+
+---
+
+## End a session
 
 ```bash
 uv run captions session delete <channel>
 ```
 
-Uses your **root** API key to publish a final `caption` message with `ended: true`. Ably does not erase the channel; tokens already minted still expire on schedule. Use **`--dry-run`** to inspect the payload without publishing.
+Subscribers see that the session ended. Old tokens still expire on their own schedule.
 
-List channels that Ably currently considers **active** (recently used):
+**New tokens** for the same channel (e.g. someone lost their link):
 
 ```bash
-uv run captions session list
-uv run captions session list --prefix 'captions:'
-uv run captions session list --json
+uv run captions tokens subscriber <channel>
+uv run captions tokens publisher <channel>
 ```
 
-Needs **channel-metadata** on `*` for your API key (root keys usually do). This is rate-limited; one page is returned by default — use **`--all-pages`** to follow Ably’s `next` links (still capped).
+---
 
-## Serve the static web UI
+## Rehearsal checklist (two phones)
 
-Subscribers can use the **subscriber URL** from `session new` (GitHub Pages by default).
+1. Facilitator: `export CAPTIONS_ABLY_API_KEY=…` and `uv run captions session new`.
+2. Phone A: open subscriber link, paste **subscriber** token, wait until it says it is listening.
+3. Facilitator: open the publisher test page (local or hosted), paste **publisher** token, send a test line.
+4. Phone A should update. If not, see [Troubleshooting](#troubleshooting).
 
-For local development, Ably accepts `http://localhost`. Serve `web/` with a static server (not `file://`):
+---
+
+## Troubleshooting
+
+**Both sides say “connected” but no text**
+
+- **Channel mismatch** — The name in the subscriber URL must match the facilitator’s channel exactly (including capitals).
+- **Wrong token** — Publisher page needs the **publisher** token; subscribers need the **subscriber** token. They are not interchangeable.
+- **Old token cached** — Subscriber: **Clear saved token**, then reconnect with the new link.
+
+**“Channel denied access” or publish errors**
+
+- Often a **subscriber** token was used on the publisher side, or the Ably key is too restricted. Use a normal root API key on the facilitator machine until you have a dedicated setup.
+
+**Jitsi: no audio or bot cannot join**
+
+- Room must be **open** (no password, no lobby, not members-only).
+- Run `npm install` in `jitsi-audio-puller` if you have not already.
+
+**Whisper / no captions from audio**
+
+- Confirm `WHISPER_CPP_HOME` points at a built whisper.cpp tree and a model file exists.
+- On Linux pulse mode, use `-v` to see whether transcription is running on the facilitator machine.
+
+---
+
+## For developers
+
+### Install and environment
 
 ```bash
-cd web
+cd /path/to/captions
+uv sync
+export CAPTIONS_ABLY_API_KEY='your_app_id.key_id:secret'
+```
+
+Optional environment variables:
+
+| Variable | Purpose |
+|----------|---------|
+| `CAPTIONS_SUBSCRIBER_PAGES_BASE` | Base URL for subscriber links (default: project GitHub Pages `docs/`). |
+| `CAPTIONS_TOKEN_TTL` | Token lifetime in seconds (default `14400`). |
+| `WHISPER_CPP_HOME` | whisper.cpp root; binary `build/bin/whisper-stream-pcm`, model under `models/`. |
+| `CAPTIONS_WHISPER_STREAM_PCM` / `CAPTIONS_WHISPER_MODEL` | Override whisper binary or model path. |
+| `CAPTIONS_JITSI_PULLER_SCRIPT` | Path to `jitsi-audio-puller/index.js` (default: `<repo>/jitsi-audio-puller/index.js`). |
+| `CAPTIONS_NODE_BIN` | Node executable for Jitsi capture (default `node`). |
+
+### CLI reference
+
+```bash
+uv run captions session new [--json] [--channel NAME] [--ttl SECONDS]
+uv run captions session new --pulse [-v]          # Linux: PulseAudio → whisper → Ably
+uv run captions session new --jitsi URL [-v] [--mixed] [--reconnect] [--max-speakers N]
+uv run captions session list [--prefix captions:] [--json] [--all-pages]
+uv run captions session delete <channel> [--dry-run]
+uv run captions tokens publisher <channel>
+uv run captions tokens subscriber <channel>
+uv run captions whisper pulse --channel CH [--publisher-token T] [-v] [--dry-run] ...
+uv run captions whisper jitsi --channel CH --jitsi-url URL [-v] [--mixed] ...
+```
+
+`session new --json` prints channel, `subscriber_url`, and tokens for scripting. `--pulse`, `--jitsi`, and `--json` are mutually exclusive where noted in `--help`.
+
+Jitsi channel default: `captions:<room>` derived from the meeting URL. Explicit `--channel` overrides.
+
+### Serve the web UI locally
+
+Ably allows `http://localhost`. From `web/`:
+
+```bash
 python -m http.server 8765
 ```
 
-- **Subscribers (phones / second screen):**  
-  `http://localhost:8765/subscriber/index.html?channel=YOUR_CHANNEL`  
-  Use the exact **`channel`** string from `session new` in the query (URL-encode if needed). Paste the **subscriber** token, tap **Save & connect**.
+- Subscriber: `http://localhost:8765/subscriber/index.html?channel=YOUR_CHANNEL`
+- Publisher (test): `http://localhost:8765/publisher/index.html`
 
-- **Facilitator test publisher (no whisper):**  
-  `http://localhost:8765/publisher/index.html`  
-  Paste **channel** + **publisher** token, **Connect**, then use partial/final buttons.
+Use the machine’s LAN IP for phones on the same network.
 
-For phones on the same LAN, use your machine’s LAN IP instead of `localhost`.
+### Browser publisher (`glue.js`)
 
-## Wire whisper.cpp (browser)
-
-1. Load Ably and the helper after your whisper bundle:
+Load after your whisper bundle:
 
 ```html
 <script src="https://cdn.ably.com/lib/ably.min-2.js"></script>
 <script src="http://localhost:8765/publisher/glue.js"></script>
 ```
 
-2. Once per session (after you have `channel` + `publisher_token` from the CLI):
-
 ```javascript
 await connectCaptionsPublisher({
   channel: "<channel from session new>",
   token: "<publisher_token>",
 });
-```
 
-3. On each whisper update (interim or final):
-
-```javascript
 publishCaption({
   text: transcriptString,
   kind: isFinal ? "final" : "partial",
 });
 ```
 
-You can pass **raw whisper-style stdout** in `text` (ANSI CSI/OSC, carriage-return rewrites). Subscribers strip escapes and apply the same “last `\r` segment + duplicate-prefix collapse” rules as the Python helper `normalize_whisper_stdout_line`.
+`CaptionsAblyPublisher` supports `debounceMs` / `minIntervalMs`. Raw whisper terminal output (ANSI, `\r` rewrites) is normalized on subscribers the same way as the Python relay.
 
-Or use the class directly for more control:
+### whisper pulse / jitsi (implementation notes)
 
-```javascript
-const pub = new CaptionsAblyPublisher({ debounceMs: 450, minIntervalMs: 450 });
-await pub.connect({ channel, token });
-pub.publishCaption({ text: "…", kind: "partial" });
-```
+- **pulse:** `ffmpeg` → `whisper-stream-pcm`; stdout on a pseudo-TTY for `\r`/ANSI behavior; `--line-kind auto|partial|final`; `--debounce-ms` / `--min-interval-ms` on partials.
+- **jitsi:** `node jitsi-audio-puller/index.js`; default **per-speaker** FIFOs; `--mixed` for single summed stream. See [jitsi-audio-puller/README.md](jitsi-audio-puller/README.md) for FIFO layout and standalone `node` usage.
 
-Coalescing keeps partial traffic roughly under **~2 messages/second**; finals flush immediately.
+### Project layout
 
-## Publish from whisper.cpp (PulseAudio, CLI)
-
-Linux only: capture from PulseAudio, run **`whisper-stream-pcm`**, and publish transcript lines to Ably.
-
-You can mint tokens and start pulse in one step: **`uv run captions session new --pulse`** (see *Create a session*). The flow below is the explicit two-command form.
-
-```bash
-export CAPTIONS_PUBLISHER_TOKEN='<publisher_token from session new>'
-export WHISPER_CPP_HOME=/path/to/whisper.cpp   # defaults: build/bin/whisper-stream-pcm, models/ggml-base.bin
-
-uv run captions whisper pulse --channel '<channel from session new>' -v
-```
-
-Use **`--dry-run`** to print the resolved `ffmpeg | whisper-stream-pcm` shell command without running Ably or audio. Paths can be overridden with `--whisper-binary`, `-m` / `--model`, or env **`CAPTIONS_WHISPER_STREAM_PCM`** / **`CAPTIONS_WHISPER_MODEL`**. The pulse pipeline attaches whisper’s **stdout to a pseudo-TTY** (winsize matched to your **stderr** when it’s a terminal), so whisper uses the same **`\r` / ANSI rewrites** as when you run it interactively; a plain pipe would make it fall back to newline logging and look “duplicated”. **`--verbose`** (`-v`) copies that **raw PTY output** to **`stderr`** in **chunks** via `stderr.buffer` (no log prefixes). Ably client log noise stays suppressed during **`whisper pulse`**.
-
-**`--line-kind`** defaults to **`auto`**: the relay (`WhisperStdoutStreamProcessor`) decodes UTF-8 incrementally, emits **`partial`** when the on-screen transcript changes (`\r` rewrites plus growing tail lines), and **`final`** when a `\n`-terminated line completes. Use **`partial`** or **`final`** for legacy behavior: one emission per `\n`-only record, forced kind throughout. Subscriber pages still **`normalize_whisper_stdout_line`** on each caption payload text so display matches whisper’s terminal rules.
-
-Captions payloads use **`kind: partial | final`**; partials honor **`--debounce-ms`** and **`--min-interval-ms`** while finals bypass debounce, so `\r`-heavy transcripts may need tuning.
-
-## Publish from Jitsi (CLI)
-
-Headless capture uses the in-repo **[jitsi-audio-puller](jitsi-audio-puller/)** Node bot (not a git submodule). Install its deps once:
-
-```bash
-cd jitsi-audio-puller && npm install && cd ..
-```
-
-Mint a session and start captioning from an open Jitsi room (no password / lobby). Channel defaults to `captions:<room-name>` derived from the URL:
-
-```bash
-export CAPTIONS_ABLY_API_KEY='…'
-export WHISPER_CPP_HOME=/path/to/whisper.cpp
-
-uv run captions session new --jitsi 'https://meet.jit.si/MyRoom' -v
-```
-
-**Per-speaker** mode (default) runs one whisper pipeline per remote audio track. **`--mixed`** sums everyone into a single stream (legacy). **`--reconnect`** reuses cached tokens for the same room-derived channel. Override the puller script with **`--jitsi-puller-script`** or env **`CAPTIONS_JITSI_PULLER_SCRIPT`**.
-
-Two-step form after `session new` without `--jitsi`:
-
-```bash
-uv run captions whisper jitsi --channel '<channel>' --jitsi-url 'https://meet.jit.si/MyRoom' -v
-```
-
-The room must allow the **`captions-bot`** participant (open meeting). See [jitsi-audio-puller/README.md](jitsi-audio-puller/README.md) for FIFO formats and standalone `node index.js` usage.
-
-## Two-phone rehearsal checklist
-
-1. Export `CAPTIONS_ABLY_API_KEY` on the facilitator laptop.
-2. Run `uv run captions session new` — copy **`subscriber_token`** and note **`channel`**.
-3. Start `python -m http.server 8765` from `web/`.
-4. On phone A (subscriber): open subscriber URL **with `?channel=`** matching the CLI output exactly; paste **subscriber** token; status should reach **Listening · channel attached** before testing.
-5. On laptop: open publisher test page → connect with **publisher** token → send partial/final; confirm phone A updates.
-6. End session by closing tabs; optionally rotate session (`session new`) for the next meeting so old tokens expire naturally.
-
-## Troubleshooting (both show “connected” but no captions move)
-
-1. **Channel mismatch** — The publisher tab’s channel string must exactly match the subscriber URL `?channel=` value (same spelling and case; Ably channel names are case-sensitive).
-
-2. **Swapped tokens** — Publisher UI needs **`publisher_token`**. Subscriber paste needs **`subscriber_token`**.
-
-3. **Stale subscriber storage** — After changing sessions, subscriber may cache an old channel/token; tap **Clear saved token** and reopen with the new `?channel=`.
-
-4. **Empty publisher draft** — The dev publisher requires **non-empty** text before **Send partial** / **Send final**.
-
-5. **DevTools console** — Publisher logs **`Ably publish failed`** on rejections; subscriber logs **`[captions-relay subscriber]`** for subscribe/attach errors.
-
-6. **`Channel denied access…` / Ably code 40160** — Tokens are capped to the channel you minted for. Typical causes: the **subscriber** token was pasted into the publisher (no **publish** on that channel); or **`CAPTIONS_ABLY_API_KEY`** is a **restricted** key — minted caps are intersected with the key’s dashboard scope, which can forbid publish entirely. Prefer a default full-access/root key until you carve a dedicated token-minting key with **publish + subscribe** on the channels or patterns you use (e.g. `captions:*`).
+- `src/captions_relay/` — CLI, Ably tokens, pulse/Jitsi pipelines
+- `web/` — static subscriber and publisher pages
+- `docs/` — GitHub Pages subscriber host
+- `jitsi-audio-puller/` — headless Jitsi audio bot (Node)
