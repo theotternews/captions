@@ -6,6 +6,7 @@ Python CLI plus static web pages that relay **live caption text** to a small aud
 
 - [uv](https://docs.astral.sh/uv/) and Python **3.13+**
 - An Ably account and **root API key** (Dashboard → API keys)
+- For Jitsi capture: **Node.js 20+** and dependencies in [`jitsi-audio-puller/`](jitsi-audio-puller/) (`npm install` there once)
 
 ## Install (dev)
 
@@ -150,6 +151,33 @@ Use **`--dry-run`** to print the resolved `ffmpeg | whisper-stream-pcm` shell co
 **`--line-kind`** defaults to **`auto`**: the relay (`WhisperStdoutStreamProcessor`) decodes UTF-8 incrementally, emits **`partial`** when the on-screen transcript changes (`\r` rewrites plus growing tail lines), and **`final`** when a `\n`-terminated line completes. Use **`partial`** or **`final`** for legacy behavior: one emission per `\n`-only record, forced kind throughout. Subscriber pages still **`normalize_whisper_stdout_line`** on each caption payload text so display matches whisper’s terminal rules.
 
 Captions payloads use **`kind: partial | final`**; partials honor **`--debounce-ms`** and **`--min-interval-ms`** while finals bypass debounce, so `\r`-heavy transcripts may need tuning.
+
+## Publish from Jitsi (CLI)
+
+Headless capture uses the in-repo **[jitsi-audio-puller](jitsi-audio-puller/)** Node bot (not a git submodule). Install its deps once:
+
+```bash
+cd jitsi-audio-puller && npm install && cd ..
+```
+
+Mint a session and start captioning from an open Jitsi room (no password / lobby). Channel defaults to `captions:<room-name>` derived from the URL:
+
+```bash
+export CAPTIONS_ABLY_API_KEY='…'
+export WHISPER_CPP_HOME=/path/to/whisper.cpp
+
+uv run captions session new --jitsi 'https://meet.jit.si/MyRoom' -v
+```
+
+**Per-speaker** mode (default) runs one whisper pipeline per remote audio track. **`--mixed`** sums everyone into a single stream (legacy). **`--reconnect`** reuses cached tokens for the same room-derived channel. Override the puller script with **`--jitsi-puller-script`** or env **`CAPTIONS_JITSI_PULLER_SCRIPT`**.
+
+Two-step form after `session new` without `--jitsi`:
+
+```bash
+uv run captions whisper jitsi --channel '<channel>' --jitsi-url 'https://meet.jit.si/MyRoom' -v
+```
+
+The room must allow the **`captions-bot`** participant (open meeting). See [jitsi-audio-puller/README.md](jitsi-audio-puller/README.md) for FIFO formats and standalone `node index.js` usage.
 
 ## Two-phone rehearsal checklist
 

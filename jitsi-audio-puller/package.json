@@ -1,0 +1,18 @@
+{
+  "name": "jitsi-audio-puller",
+  "version": "1.0.0",
+  "description": "Headless bot that streams mixed audio from a Jitsi meeting to a named pipe",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "lib-jitsi-meet": "https://github.com/jitsi/lib-jitsi-meet/releases/download/v2155.0.0%2B9624ece9/lib-jitsi-meet.tgz",
+    "@roamhq/wrtc": "^0.10.0",
+    "jsdom": "^26.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

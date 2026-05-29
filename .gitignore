@@ -2,3 +2,4 @@ __pycache__/
 *.py[cod]
 *$py.class
 .captions/
+jitsi-audio-puller/node_modules/
