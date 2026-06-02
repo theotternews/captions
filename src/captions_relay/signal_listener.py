@@ -18,6 +18,7 @@ import asyncio
 import json
 import re
 import sys
+import time
 from urllib.parse import urlparse
 
 from ably.sync.util.exceptions import AblyException
@@ -95,6 +96,8 @@ class SignalListener:
 
         self._proc: asyncio.subprocess.Process | None = None
         self._req_id = 0
+        # Epoch ms at startup; messages sent earlier (offline backlog) are ignored.
+        self._started_at_ms = 0.0
         # One active session per sender: sender -> {channel, url, proc, watcher}.
         self._sessions: dict[str, dict] = {}
         # Last Jitsi URL seen per sender, so 'restart' can omit the link.
@@ -102,6 +105,7 @@ class SignalListener:
 
     async def run(self) -> int:
         """Start signal-cli and process incoming messages until it exits."""
+        self._started_at_ms = time.time() * 1000
         _log(
             f"starting signal-cli for account {self.account} "
             f"(allowed senders: {', '.join(sorted(self.allowed_senders)) or 'NONE'}"
@@ -166,6 +170,7 @@ class SignalListener:
         data_message = envelope.get("dataMessage") or {}
         text = data_message.get("message")
         sender = source
+        msg_ts = envelope.get("timestamp")
 
         # Only act on direct (1:1) messages; ignore group chats.
         if text is not None and data_message.get("groupInfo"):
@@ -178,8 +183,15 @@ class SignalListener:
             if sent_message.get("message") is not None and not sent_message.get("groupInfo"):
                 text = sent_message.get("message")
                 sender = self.account
+                msg_ts = sent_message.get("timestamp") or msg_ts
 
         if not sender or text is None:
+            return
+
+        # Ignore the offline backlog signal-cli delivers on connect: only act on
+        # messages sent after this listener started.
+        if isinstance(msg_ts, (int, float)) and msg_ts < self._started_at_ms:
+            _log(f"ignoring message from {sender} sent before startup")
             return
 
         is_self = sender == self.account
@@ -234,7 +246,7 @@ class SignalListener:
         await self._reply(
             sender,
             f"Unknown command. Use: '{_PREFIX} start <jitsi link>', "
-            f"'{_PREFIX} restart [jitsi link]', '{_PREFIX} stop', or '{_PREFIX} status'.",
+            f"'{_PREFIX} restart', '{_PREFIX} stop', or '{_PREFIX} status'.",
         )
 
     async def _start_session(self, sender: str, url: str, *, restart: bool) -> None:

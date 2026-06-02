@@ -512,6 +512,7 @@ function attachAudioTrack(track) {
         muted,
         receivingAudio: false,
         gotData: false,
+        addedAt: Date.now(),
         sinkStartedAt: 0,
         sinkRestarts: 0,
         pipePath,
@@ -550,6 +551,17 @@ function createSinkForEntry(entry, mediaTrack) {
 // the track's current MediaStreamTrack.
 const SINK_DATA_GRACE_MS = 2500;
 const MAX_SINK_RESTARTS = 10;
+// When the join/renegotiation window orphans the *receiver* (not just the sink),
+// rebuilding sinks against the same dead track never recovers audio — only a fresh
+// RTCPeerConnection does. If no PCM ever arrives from any unmuted track within this
+// window, escalate to a full reconnect (process exits retryably; the Python wrapper
+// relaunches with a new connection — the same recovery a manual restart performs).
+const NO_AUDIO_RECONNECT_MS = 9000;
+// When the bot joins a room where a participant is already present, lib-jitsi-meet
+// sometimes never delivers TRACK_ADDED for that participant and the roster sweep finds
+// no audio track, so no sink is ever created. A fresh connection renegotiates and gets
+// the track, so reconnect if participants are present but no track attached in time.
+const NO_TRACKS_RECONNECT_MS = 8000;
 let sinkWatchdog = null;
 
 function checkSinks() {
@@ -570,6 +582,41 @@ function checkSinks() {
         try { entry.sink.stop(); } catch (_) { /* no-op */ }
         createSinkForEntry(entry, mediaTrack);
     }
+
+    maybeReconnectForNoAudio(now);
+}
+
+// Force a full reconnect (which the Python wrapper turns into a fresh connection) when
+// audio cannot reach whisper on this connection. Two cases:
+//   A. Remote participants are present but no audio track ever attached (missed
+//      TRACK_ADDED on join — the common "needs a manual restart" symptom).
+//   B. A track attached but its receiver is orphaned and produces no PCM.
+function maybeReconnectForNoAudio(now) {
+    if (disconnecting || !conferenceReady) return;
+
+    if (trackSinks.size === 0) {
+        let participantCount = 0;
+        try { participantCount = (room && room.getParticipants() || []).length; } catch (_) { return; }
+        if (participantCount === 0 || !conferenceJoinedAt) return;
+        if (now - conferenceJoinedAt < NO_TRACKS_RECONNECT_MS) return;
+        log(
+            `No remote audio tracks attached ${NO_TRACKS_RECONNECT_MS}ms after join despite `
+            + `${participantCount} participant(s) — forcing a full reconnect`,
+        );
+        disconnect('no audio tracks attached — reconnecting', { retryable: true });
+        return;
+    }
+
+    const unmuted = [...trackSinks.values()].filter(e => !e.muted);
+    if (unmuted.length === 0) return;
+    if (unmuted.some(e => e.gotData)) return;
+    if (!unmuted.some(e => now - e.addedAt >= NO_AUDIO_RECONNECT_MS)) return;
+
+    log(
+        `No audio from any unmuted track after ${NO_AUDIO_RECONNECT_MS}ms and sink rebuilds `
+        + '— forcing a full reconnect',
+    );
+    disconnect('no audio received — reconnecting', { retryable: true });
 }
 
 function startSinkWatchdog() {
@@ -650,6 +697,7 @@ let exitCode = 0;
 let room = null;
 let connection = null;
 let conferenceReady = false;
+let conferenceJoinedAt = 0;
 
 async function disconnect(reason, { retryable = false } = {}) {
     if (disconnecting) return;
@@ -845,6 +893,7 @@ function onConnectionEstablished() {
 
     room.on(JitsiMeetJS.events.conference.CONFERENCE_JOINED, () => {
         room.setDisplayName('captions-bot');
+        conferenceJoinedAt = Date.now();
 
         try {
             room.setReceiverConstraints({ lastN: 0, defaultConstraints: { maxHeight: 0 } });

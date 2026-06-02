@@ -192,6 +192,7 @@ uv run captions tokens publisher <channel>
 
 - Room must be **open** (no password, no lobby, not members-only).
 - Run `npm install` in `jitsi-audio-puller` if you have not already.
+- The headless WebRTC stack sometimes fails to deliver a participant's audio on the first join (no track attached, or an orphaned receiver that produces no PCM), so nothing reaches whisper. The bot now detects both cases — participants present but no audio track attached within ~8s, or a track that yields no audio within ~9s — and automatically reconnects with a fresh connection, the same recovery a manual restart performs. You should no longer need to restart by hand.
 
 **Whisper / no captions from audio**
 
