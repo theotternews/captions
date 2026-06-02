@@ -23,6 +23,11 @@ from captions_relay.config import (
     ENV_NODE_BIN,
     ENV_JITSI_PULLER_SCRIPT,
     ENV_PUBLISHER_TOKEN,
+    ENV_SIGNAL_ACCOUNT,
+    ENV_SIGNAL_ALLOW_SELF,
+    ENV_SIGNAL_ALLOWED_SENDERS,
+    ENV_SIGNAL_CLI_BIN,
+    ENV_SIGNAL_JITSI_HOSTS,
     ENV_TOKEN_TTL,
     ENV_WHISPER_BINARY,
     ENV_WHISPER_CPP_HOME,
@@ -32,6 +37,9 @@ from captions_relay.config import (
     WHISPER_CPP_REL_MODELS_DIR,
     default_jitsi_puller_script,
     normalize_caption_channel,
+    signal_allowed_senders,
+    signal_cli_bin as default_signal_cli_bin,
+    signal_jitsi_hosts,
     subscriber_index_url,
 )
 from captions_relay import session_cache
@@ -1066,3 +1074,171 @@ def whisper_jitsi(
         mixed=mixed,
         max_speakers=max_speakers,
     )
+
+
+@main.group()
+def signal() -> None:
+    """Start caption sessions remotely via Signal (signal-cli)."""
+
+
+@signal.command("link")
+@click.option(
+    "--signal-cli-bin",
+    type=str,
+    default=None,
+    envvar=ENV_SIGNAL_CLI_BIN,
+    help=f"signal-cli executable (env {ENV_SIGNAL_CLI_BIN}, default: signal-cli).",
+)
+@click.option(
+    "--name",
+    "device_name",
+    type=str,
+    default="captions",
+    show_default=True,
+    help="Linked-device name shown in your Signal app.",
+)
+def signal_link(signal_cli_bin: str | None, device_name: str) -> None:
+    """Link this machine to your existing Signal account (one-time).
+
+    Runs ``signal-cli link`` and prints an ``sgnl://linkdevice...`` URI. Encode it as a
+    QR code (e.g. with ``qrencode -t ANSI``) and scan it from your phone via
+    Signal -> Settings -> Linked Devices -> Link New Device.
+    """
+    import subprocess
+
+    bin_path = (signal_cli_bin or "").strip() or default_signal_cli_bin()
+    try:
+        proc = subprocess.run([bin_path, "link", "-n", device_name], check=False)
+    except FileNotFoundError as e:
+        raise click.ClickException(
+            f"Could not run {bin_path!r}: {e}. Install signal-cli or set {ENV_SIGNAL_CLI_BIN}."
+        ) from e
+    raise SystemExit(proc.returncode)
+
+
+@signal.command("listen")
+@click.option(
+    "--account",
+    type=str,
+    default=None,
+    envvar=ENV_SIGNAL_ACCOUNT,
+    help=f"Signal account E.164 this device is linked to (env {ENV_SIGNAL_ACCOUNT}).",
+)
+@click.option(
+    "--signal-cli-bin",
+    type=str,
+    default=None,
+    envvar=ENV_SIGNAL_CLI_BIN,
+    help=f"signal-cli executable (env {ENV_SIGNAL_CLI_BIN}, default: signal-cli).",
+)
+@click.option(
+    "--allowed-senders",
+    type=str,
+    default=None,
+    envvar=ENV_SIGNAL_ALLOWED_SENDERS,
+    help=(
+        "Comma-separated trusted sender E.164 numbers "
+        f"(env {ENV_SIGNAL_ALLOWED_SENDERS}). Messages from anyone else are ignored."
+    ),
+)
+@click.option(
+    "--jitsi-hosts",
+    type=str,
+    default=None,
+    envvar=ENV_SIGNAL_JITSI_HOSTS,
+    help=(
+        "Comma-separated allowed Jitsi hostnames "
+        f"(env {ENV_SIGNAL_JITSI_HOSTS}, default: meet.jit.si)."
+    ),
+)
+@click.option(
+    "--ttl",
+    type=int,
+    default=None,
+    help=f"Token lifetime in seconds (default: 14400 or {ENV_TOKEN_TTL}).",
+)
+@click.option(
+    "--captions-bin",
+    type=str,
+    default="captions",
+    show_default=True,
+    help="captions executable used to launch the Jitsi pipeline.",
+)
+@click.option(
+    "--max-speakers",
+    type=int,
+    default=8,
+    show_default=True,
+    help="Max concurrent whisper instances for started sessions (per-speaker mode).",
+)
+@click.option(
+    "--allow-self",
+    is_flag=True,
+    envvar=ENV_SIGNAL_ALLOW_SELF,
+    help=(
+        "Testing only: also honor commands you send from your own (linked) account, "
+        f"disabling loop protection (env {ENV_SIGNAL_ALLOW_SELF})."
+    ),
+)
+@click.option("-v", "--verbose", is_flag=True, help="Echo signal-cli stderr and captioned lines.")
+def signal_listen(
+    account: str | None,
+    signal_cli_bin: str | None,
+    allowed_senders: str | None,
+    jitsi_hosts: str | None,
+    ttl: int | None,
+    captions_bin: str,
+    max_speakers: int,
+    allow_self: bool,
+    verbose: bool,
+) -> None:
+    """Listen for trusted Signal messages and start/stop caption sessions on demand.
+
+    A direct message containing an allowed Jitsi URL starts captions and replies with the
+    subscriber link/token; ``stop`` ends the current session. signal-cli connects outbound
+    only -- no router port and no remote shell access. Link this device first with
+    ``captions signal link``.
+    """
+    acct = (account or "").strip()
+    if not acct:
+        raise click.UsageError(
+            f"Pass --account or set {ENV_SIGNAL_ACCOUNT} to the Signal account E.164 "
+            "this device is linked to."
+        )
+
+    bin_path = (signal_cli_bin or "").strip() or default_signal_cli_bin()
+
+    if allowed_senders is not None:
+        senders = {s.strip() for s in allowed_senders.split(",") if s.strip()}
+    else:
+        senders = signal_allowed_senders()
+
+    if jitsi_hosts is not None:
+        hosts = {h.strip().lower() for h in jitsi_hosts.split(",") if h.strip()}
+    else:
+        hosts = signal_jitsi_hosts()
+    if not hosts:
+        hosts = signal_jitsi_hosts()
+
+    ttl_eff = ttl if ttl is not None else _default_ttl()
+
+    from captions_relay.signal_listener import run_signal_listener
+
+    try:
+        exit_code = asyncio.run(
+            run_signal_listener(
+                account=acct,
+                signal_cli_bin=bin_path,
+                allowed_senders=senders,
+                allowed_jitsi_hosts=hosts,
+                ttl_seconds=ttl_eff,
+                captions_bin=captions_bin,
+                max_speakers=max_speakers,
+                verbose=verbose,
+                allow_self=allow_self,
+            )
+        )
+    except KeyboardInterrupt:
+        click.echo("", err=True)
+        raise SystemExit(130) from None
+    raise SystemExit(exit_code)

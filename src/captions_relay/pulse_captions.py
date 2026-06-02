@@ -70,6 +70,10 @@ def _pulse_pty_set_winsize(slave_fd: int) -> None:
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _ANSI_OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 
+# Bracketed status markers whisper.cpp streaming prints around the transcript itself
+# (not speech); dropped so they never reach subscribers.
+_WHISPER_CONTROL_LINE_RE = re.compile(r"^\[\s*Start (?:streaming|speaking)\s*\]$", re.IGNORECASE)
+
 
 def normalize_whisper_stdout_line(raw: str, *, min_dup_prefix: int = 4) -> str:
     """Turn TTY-oriented whisper stdout into plain caption text.
@@ -82,7 +86,10 @@ def normalize_whisper_stdout_line(raw: str, *, min_dup_prefix: int = 4) -> str:
     if "\r" in s:
         s = s.split("\r")[-1]
     s = _collapse_redundant_prefix_repeat(s.strip(), min_prefix=min_dup_prefix)
-    return s.strip()
+    s = s.strip()
+    if _WHISPER_CONTROL_LINE_RE.match(s):
+        return ""
+    return s
 
 
 def _collapse_redundant_prefix_repeat(s: str, *, min_prefix: int) -> str:

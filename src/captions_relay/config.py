@@ -16,6 +16,14 @@ ENV_WHISPER_CPP_HOME = "WHISPER_CPP_HOME"
 ENV_SUBSCRIBER_PAGES_BASE = "CAPTIONS_SUBSCRIBER_PAGES_BASE"
 ENV_NODE_BIN = "CAPTIONS_NODE_BIN"
 ENV_JITSI_PULLER_SCRIPT = "CAPTIONS_JITSI_PULLER_SCRIPT"
+ENV_SIGNAL_ACCOUNT = "CAPTIONS_SIGNAL_ACCOUNT"
+ENV_SIGNAL_CLI_BIN = "CAPTIONS_SIGNAL_CLI_BIN"
+ENV_SIGNAL_ALLOWED_SENDERS = "CAPTIONS_SIGNAL_ALLOWED_SENDERS"
+ENV_SIGNAL_JITSI_HOSTS = "CAPTIONS_SIGNAL_JITSI_HOSTS"
+ENV_SIGNAL_ALLOW_SELF = "CAPTIONS_SIGNAL_ALLOW_SELF"
+
+_DEFAULT_SIGNAL_CLI_BIN = "signal-cli"
+_DEFAULT_SIGNAL_JITSI_HOSTS = ("meet.jit.si",)
 
 # jitsi-audio-puller lives at <project-root>/jitsi-audio-puller/index.js;
 # __file__ is src/captions_relay/config.py so .parent*3 is the project root.
@@ -105,4 +113,68 @@ def normalize_caption_channel(raw: str) -> str:
     if not s:
         raise ValueError("Channel name must be non-empty.")
     return validate_ably_channel_name(s)
+
+
+def _normalize_phone(raw: str) -> str:
+    """Trim whitespace and surrounding punctuation from a phone-number-like string."""
+    return (raw or "").strip()
+
+
+def signal_account() -> str:
+    """Return the linked Signal account E.164 (env ``CAPTIONS_SIGNAL_ACCOUNT``)."""
+    acct = _normalize_phone(os.environ.get(ENV_SIGNAL_ACCOUNT, ""))
+    if not acct:
+        raise ValueError(
+            f"Set {ENV_SIGNAL_ACCOUNT} to the Signal account E.164 this device is linked to "
+            f"(e.g. export {ENV_SIGNAL_ACCOUNT}=+15551234567)."
+        )
+    return acct
+
+
+def signal_cli_bin() -> str:
+    """Path to the ``signal-cli`` executable (env ``CAPTIONS_SIGNAL_CLI_BIN``)."""
+    return os.environ.get(ENV_SIGNAL_CLI_BIN, "").strip() or _DEFAULT_SIGNAL_CLI_BIN
+
+
+def signal_allowed_senders() -> set[str]:
+    """Trusted sender E.164 numbers from ``CAPTIONS_SIGNAL_ALLOWED_SENDERS`` (comma-separated)."""
+    raw = os.environ.get(ENV_SIGNAL_ALLOWED_SENDERS, "")
+    return {p for p in (_normalize_phone(x) for x in raw.split(",")) if p}
+
+
+def signal_jitsi_hosts() -> set[str]:
+    """Allowed Jitsi hostnames for Signal-triggered sessions.
+
+    From ``CAPTIONS_SIGNAL_JITSI_HOSTS`` (comma-separated, lowercased); defaults to
+    ``meet.jit.si``.
+    """
+    raw = os.environ.get(ENV_SIGNAL_JITSI_HOSTS, "")
+    hosts = {h.strip().lower() for h in raw.split(",") if h.strip()}
+    return hosts or set(_DEFAULT_SIGNAL_JITSI_HOSTS)
+
+
+def validate_jitsi_url(url: str, *, allowed_hosts: set[str] | None = None) -> str:
+    """Validate a Jitsi meeting URL for use as a trigger.
+
+    Requires an ``https`` scheme, a non-empty path (room), and a host in
+    ``allowed_hosts`` (defaults to :func:`signal_jitsi_hosts`). Returns the stripped
+    URL or raises :class:`ValueError`.
+    """
+    s = (url or "").strip()
+    if not s:
+        raise ValueError("Jitsi URL must be non-empty.")
+    parsed = urlparse(s)
+    if parsed.scheme != "https":
+        raise ValueError("Jitsi URL must use https.")
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise ValueError("Jitsi URL must include a host.")
+    hosts = allowed_hosts if allowed_hosts is not None else signal_jitsi_hosts()
+    if host not in hosts:
+        raise ValueError(
+            f"Jitsi host {host!r} is not allowed (allowed: {', '.join(sorted(hosts)) or 'none'})."
+        )
+    if not parsed.path.strip("/"):
+        raise ValueError("Jitsi URL must include a room name in the path.")
+    return s
 

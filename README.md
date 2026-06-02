@@ -82,6 +82,74 @@ To resume the same Jitsi room without minting new tokens, add `--reconnect` to `
 
 ---
 
+## Start a session remotely over Signal
+
+Let trusted colleagues kick off captions by sending a Jitsi link to your **existing Signal account** — even when they are not on your network. Your machine runs a listener that watches your Signal messages and, on an allowed request, starts captions and replies with the subscriber link.
+
+This uses [`signal-cli`](https://github.com/AsamK/signal-cli), which makes **outbound-only** connections to Signal's servers. There is **no router port to open** and it grants **no remote shell access** — only the specific actions below.
+
+### One-time setup
+
+1. **Install signal-cli** (it needs a Java runtime). See the [signal-cli releases](https://github.com/AsamK/signal-cli/releases). Confirm it runs:
+   ```bash
+   signal-cli --version
+   ```
+2. **Link this machine to your Signal account** (no new phone number needed):
+   ```bash
+   uv run captions signal link
+   ```
+   This prints an `sgnl://linkdevice…` URI. Turn it into a QR code and scan it from your phone via **Signal → Settings → Linked Devices → Link New Device**:
+   ```bash
+   uv run captions signal link | grep '^sgnl://' | qrencode -t ANSI
+   ```
+3. **Set the listener environment** on the facilitator machine:
+   ```bash
+   export CAPTIONS_ABLY_API_KEY='your_app_id.key_id:secret'   # already required
+   export CAPTIONS_SIGNAL_ACCOUNT='+15551230000'              # YOUR Signal number (the linked account)
+   export CAPTIONS_SIGNAL_ALLOWED_SENDERS='+15557654321,+15559876543'  # trusted colleagues
+   ```
+
+### Run the listener
+
+```bash
+uv run captions signal listen -v
+```
+
+Leave it running during the day. A trusted colleague then sends you a Signal message. Every command must start with the word **`captions`**:
+
+- `captions start https://meet.jit.si/TeamStandup` — start captions for that room. The listener replies with the **subscriber link** and **subscriber token** so they can share it with viewers. Sending `start` again (for any room) kills their current session and starts the new one.
+- `captions restart [https://meet.jit.si/TeamStandup]` — reconnect. Omit the link to reuse their last meeting. When reconnecting to the same room, the existing subscriber link/token is reused so anything they already shared keeps working. The reply is a short `Restarted captions for <room>.` rather than the full joining details.
+- `captions stop` — end their session.
+- `captions status` — report whether they have a session running.
+
+Each colleague gets **one session at a time**, tracked independently — several colleagues can run their own caption sessions simultaneously, and one person's commands never affect another's. Messages that do not start with `captions` are ignored.
+
+**Testing it yourself:** by default the listener ignores messages from your own account (loop protection). To try the commands from your own phone, run with `--allow-self` (or set `CAPTIONS_SIGNAL_ALLOW_SELF=1`) and send the `captions …` command to **Note to Self**:
+
+```bash
+uv run captions signal listen --allow-self -v
+```
+
+### Trust and safety model
+
+- **Sender allowlist** — only numbers in `CAPTIONS_SIGNAL_ALLOWED_SENDERS` are honored; everything else is silently ignored. With no allowlist set, **all** requests are ignored.
+- **Jitsi host allowlist** — only `https` URLs whose host is in `CAPTIONS_SIGNAL_JITSI_HOSTS` (default `meet.jit.si`) are accepted. Set it to your own Jitsi domain(s), comma-separated, if needed.
+- **Outbound only** — signal-cli polls Signal's servers; nothing listens for inbound connections, so no port forwarding and no remote access to your machine.
+- Messages from your own account are ignored (loop protection).
+
+### Signal environment variables
+
+| Variable | Purpose |
+|----------|---------|
+| `CAPTIONS_SIGNAL_ACCOUNT` | Your Signal account E.164 that this device is linked to (required). |
+| `CAPTIONS_SIGNAL_ALLOWED_SENDERS` | Comma-separated trusted sender E.164 numbers. |
+| `CAPTIONS_SIGNAL_JITSI_HOSTS` | Comma-separated allowed Jitsi hosts (default `meet.jit.si`). |
+| `CAPTIONS_SIGNAL_CLI_BIN` | Path to the `signal-cli` executable (default `signal-cli`). |
+
+All can also be passed as flags; see `uv run captions signal listen --help`.
+
+---
+
 ## End a session
 
 ```bash
@@ -214,7 +282,7 @@ publishCaption({
 
 ### Project layout
 
-- `src/captions_relay/` — CLI, Ably tokens, pulse/Jitsi pipelines
+- `src/captions_relay/` — CLI, Ably tokens, pulse/Jitsi pipelines, Signal listener (`signal_listener.py`)
 - `web/` — static subscriber and publisher pages
 - `docs/` — GitHub Pages subscriber host
 - `jitsi-audio-puller/` — headless Jitsi audio bot (Node)
