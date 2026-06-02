@@ -83,6 +83,7 @@ class SignalListener:
         max_speakers: int = 8,
         verbose: bool = False,
         allow_self: bool = False,
+        allow_any_jitsi_host: bool = False,
     ) -> None:
         self.account = account
         self.signal_cli_bin = signal_cli_bin
@@ -93,6 +94,7 @@ class SignalListener:
         self.max_speakers = max_speakers
         self.verbose = verbose
         self.allow_self = allow_self
+        self.allow_any_jitsi_host = allow_any_jitsi_host
 
         self._proc: asyncio.subprocess.Process | None = None
         self._req_id = 0
@@ -254,7 +256,11 @@ class SignalListener:
         # keep working; 'start' always mints fresh tokens.
         reuse_tokens = restart
         try:
-            url = validate_jitsi_url(url, allowed_hosts=self.allowed_jitsi_hosts)
+            url = validate_jitsi_url(
+                url,
+                allowed_hosts=self.allowed_jitsi_hosts,
+                allow_any_host=self.allow_any_jitsi_host,
+            )
             channel = _channel_for_jitsi_url(url)
         except ValueError as e:
             await self._reply(sender, f"Cannot start captions: {e}")
@@ -410,6 +416,7 @@ async def run_signal_listener(
     max_speakers: int = 8,
     verbose: bool = False,
     allow_self: bool = False,
+    allow_any_jitsi_host: bool = False,
 ) -> int:
     """Construct and run a :class:`SignalListener` to completion."""
     listener = SignalListener(
@@ -422,5 +429,6 @@ async def run_signal_listener(
         max_speakers=max_speakers,
         verbose=verbose,
         allow_self=allow_self,
+        allow_any_jitsi_host=allow_any_jitsi_host,
     )
     return await listener.run()

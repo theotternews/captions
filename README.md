@@ -133,7 +133,7 @@ uv run captions signal listen --allow-self -v
 ### Trust and safety model
 
 - **Sender allowlist** — only numbers in `CAPTIONS_SIGNAL_ALLOWED_SENDERS` are honored; everything else is silently ignored. With no allowlist set, **all** requests are ignored.
-- **Jitsi host allowlist** — only `https` URLs whose host is in `CAPTIONS_SIGNAL_JITSI_HOSTS` (default `meet.jit.si`) are accepted. Set it to your own Jitsi domain(s), comma-separated, if needed.
+- **Jitsi host allowlist** — only `https` URLs whose host is in `CAPTIONS_SIGNAL_JITSI_HOSTS` (default `meet.jit.si`) are accepted. Set it to your own Jitsi domain(s), comma-separated, if needed. To accept a meeting on **any** domain without restarting the server, pass `--any-jitsi-host` (or set `CAPTIONS_SIGNAL_ANY_JITSI_HOST=1`); URLs must still be well-formed `https` links with a room path, and a link that isn't a real Jitsi meeting simply fails to connect (send `captions stop` to cancel it).
 - **Outbound only** — signal-cli polls Signal's servers; nothing listens for inbound connections, so no port forwarding and no remote access to your machine.
 - Messages from your own account are ignored (loop protection).
 
@@ -144,6 +144,7 @@ uv run captions signal listen --allow-self -v
 | `CAPTIONS_SIGNAL_ACCOUNT` | Your Signal account E.164 that this device is linked to (required). |
 | `CAPTIONS_SIGNAL_ALLOWED_SENDERS` | Comma-separated trusted sender E.164 numbers. |
 | `CAPTIONS_SIGNAL_JITSI_HOSTS` | Comma-separated allowed Jitsi hosts (default `meet.jit.si`). |
+| `CAPTIONS_SIGNAL_ANY_JITSI_HOST` | Accept a meeting URL on any domain (ignores the host allowlist). |
 | `CAPTIONS_SIGNAL_CLI_BIN` | Path to the `signal-cli` executable (default `signal-cli`). |
 
 All can also be passed as flags; see `uv run captions signal listen --help`.

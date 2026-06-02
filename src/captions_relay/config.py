@@ -20,6 +20,7 @@ ENV_SIGNAL_ACCOUNT = "CAPTIONS_SIGNAL_ACCOUNT"
 ENV_SIGNAL_CLI_BIN = "CAPTIONS_SIGNAL_CLI_BIN"
 ENV_SIGNAL_ALLOWED_SENDERS = "CAPTIONS_SIGNAL_ALLOWED_SENDERS"
 ENV_SIGNAL_JITSI_HOSTS = "CAPTIONS_SIGNAL_JITSI_HOSTS"
+ENV_SIGNAL_ANY_JITSI_HOST = "CAPTIONS_SIGNAL_ANY_JITSI_HOST"
 ENV_SIGNAL_ALLOW_SELF = "CAPTIONS_SIGNAL_ALLOW_SELF"
 
 _DEFAULT_SIGNAL_CLI_BIN = "signal-cli"
@@ -153,12 +154,17 @@ def signal_jitsi_hosts() -> set[str]:
     return hosts or set(_DEFAULT_SIGNAL_JITSI_HOSTS)
 
 
-def validate_jitsi_url(url: str, *, allowed_hosts: set[str] | None = None) -> str:
+def validate_jitsi_url(
+    url: str,
+    *,
+    allowed_hosts: set[str] | None = None,
+    allow_any_host: bool = False,
+) -> str:
     """Validate a Jitsi meeting URL for use as a trigger.
 
-    Requires an ``https`` scheme, a non-empty path (room), and a host in
-    ``allowed_hosts`` (defaults to :func:`signal_jitsi_hosts`). Returns the stripped
-    URL or raises :class:`ValueError`.
+    Requires an ``https`` scheme, a host, and a non-empty path (room). Unless
+    ``allow_any_host`` is set, the host must be in ``allowed_hosts`` (defaults to
+    :func:`signal_jitsi_hosts`). Returns the stripped URL or raises :class:`ValueError`.
     """
     s = (url or "").strip()
     if not s:
@@ -169,11 +175,12 @@ def validate_jitsi_url(url: str, *, allowed_hosts: set[str] | None = None) -> st
     host = (parsed.hostname or "").lower()
     if not host:
         raise ValueError("Jitsi URL must include a host.")
-    hosts = allowed_hosts if allowed_hosts is not None else signal_jitsi_hosts()
-    if host not in hosts:
-        raise ValueError(
-            f"Jitsi host {host!r} is not allowed (allowed: {', '.join(sorted(hosts)) or 'none'})."
-        )
+    if not allow_any_host:
+        hosts = allowed_hosts if allowed_hosts is not None else signal_jitsi_hosts()
+        if host not in hosts:
+            raise ValueError(
+                f"Jitsi host {host!r} is not allowed (allowed: {', '.join(sorted(hosts)) or 'none'})."
+            )
     if not parsed.path.strip("/"):
         raise ValueError("Jitsi URL must include a room name in the path.")
     return s

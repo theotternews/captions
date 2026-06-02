@@ -26,6 +26,7 @@ from captions_relay.config import (
     ENV_SIGNAL_ACCOUNT,
     ENV_SIGNAL_ALLOW_SELF,
     ENV_SIGNAL_ALLOWED_SENDERS,
+    ENV_SIGNAL_ANY_JITSI_HOST,
     ENV_SIGNAL_CLI_BIN,
     ENV_SIGNAL_JITSI_HOSTS,
     ENV_TOKEN_TTL,
@@ -1152,6 +1153,15 @@ def signal_link(signal_cli_bin: str | None, device_name: str) -> None:
     ),
 )
 @click.option(
+    "--any-jitsi-host",
+    is_flag=True,
+    envvar=ENV_SIGNAL_ANY_JITSI_HOST,
+    help=(
+        "Accept any well-formed https meeting URL (any domain), ignoring --jitsi-hosts. "
+        f"Non-Jitsi links will simply fail to connect (env {ENV_SIGNAL_ANY_JITSI_HOST})."
+    ),
+)
+@click.option(
     "--ttl",
     type=int,
     default=None,
@@ -1186,6 +1196,7 @@ def signal_listen(
     signal_cli_bin: str | None,
     allowed_senders: str | None,
     jitsi_hosts: str | None,
+    any_jitsi_host: bool,
     ttl: int | None,
     captions_bin: str,
     max_speakers: int,
@@ -1236,6 +1247,7 @@ def signal_listen(
                 max_speakers=max_speakers,
                 verbose=verbose,
                 allow_self=allow_self,
+                allow_any_jitsi_host=any_jitsi_host,
             )
         )
     except KeyboardInterrupt:
